@@ -59,6 +59,34 @@ assert.ok(published.some(e => e.kind === 31925), 'RSVP published')
 assert.ok(published.some(e => e.kind === 7), 'reaction published')
 assert.equal(await page.textContent('.card .going'), 'going ✓')
 
+// clicking a tag filters the list, and the filter is in the URL so it can be shared
+const allCards = (await page.$$('.card')).length
+await page.click('.card .tag:has-text("#concert")')
+await page.waitForTimeout(400)
+const concertTitles = await page.$$eval('.card h3', ns => ns.map(n => n.textContent))
+console.log('after #concert:', concertTitles)
+assert.equal(concertTitles.length, 1, 'only the concert survives the filter')
+assert.match(concertTitles[0], /Schubert/)
+assert.match(await page.textContent('#filter'), /#concert/)
+assert.ok(page.url().includes('tag=concert'), 'the filter is shareable: ' + page.url())
+await page.screenshot({ path: SHOTS + '/04-tagfilter.png', fullPage: true })
+
+// a filter with no hits explains itself instead of showing the never-scouted text
+await page.click('#filter .chip')
+await page.waitForTimeout(300)
+assert.equal((await page.$$('.card')).length, allCards, 'clearing the filter restores every card')
+assert.ok(!page.url().includes('tag='), 'the cleared filter leaves the URL')
+
+// the same filter straight from the URL, on a tag only the second copy carries
+await page.goto(site.url + '/?city=munchen&when=week&tag=cinema', { waitUntil: 'networkidle' })
+await page.waitForSelector('.card', { timeout: 15000 })
+await page.waitForTimeout(800)
+const fromUrl = await page.$$eval('.card h3', ns => ns.map(n => n.textContent))
+assert.equal(fromUrl.length, 1, '?tag=cinema filters on load: ' + JSON.stringify(fromUrl))
+assert.match(fromUrl[0], /Kino/)
+await page.click('#filter .chip')
+await page.waitForTimeout(300)
+
 // the scout flow without money: PPQ must be asked, and the empty balance has to
 // surface as a top-up sheet rather than an error
 await page.click('#scout')

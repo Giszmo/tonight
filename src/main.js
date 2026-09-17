@@ -4,7 +4,7 @@ import {
   getIdentity, fetchCityEvents, fetchEndorsements, fetchFollows, fetchScoutRuns,
   fetchSources, publishSources, publishRsvp, publish, getRelays, setRelays, DEFAULT_RELAYS,
 } from './nostr.js'
-import { groupCopies } from './events.js'
+import { groupCopies, groupHasTag } from './events.js'
 import { haversineKm, geocodeCity, slugify } from './geo.js'
 import * as realPpq from './ppq.js'
 import { mockPpq } from './mockppq.js'
@@ -24,6 +24,7 @@ const state = {
   near: null,          // {lat, lon, name} from the browser geolocation API
   usingNear: false,
   when: 'tonight',
+  tag: null,           // one hashtag to filter the list by, client-side
   radiusKm: 30,
   groups: [],
   endorsements: new Map(),
@@ -113,6 +114,7 @@ function loadCities() {
   state.active = Number.isFinite(a) && a < state.cities.length ? a : 0
   const params = new URLSearchParams(location.search)
   if (params.get('when')) state.when = params.get('when')
+  if (params.get('tag')) state.tag = slugify(params.get('tag'))
   const city = params.get('city')
   if (city) {
     const i = state.cities.findIndex(c => slugify(c.name) === slugify(city))
@@ -134,6 +136,7 @@ function syncUrl() {
   const p = new URLSearchParams()
   p.set('city', state.usingNear ? 'near' : slugify(currentPlace().name))
   p.set('when', state.when)
+  if (state.tag) p.set('tag', state.tag)
   // keep the mock switch in the URL: dropping it would silently put a session
   // that is clicking around on fake money back on the real, paying API
   if (ppq.mock) p.set('mock', '1')
@@ -294,25 +297,56 @@ const usd = (v) => {
   return '$' + n.toFixed(3).replace(/0$/, '')
 }
 
+// The tag filter runs on what is already loaded: same relay data, fewer cards.
+function visibleGroups() {
+  return state.groups.filter(g => groupHasTag(g, state.tag))
+}
+
+function setTag(tag) {
+  const slug = tag ? slugify(tag) : null
+  state.tag = slug && slug !== state.tag ? slug : null
+  syncUrl()
+  render()
+}
+
+function renderFilter() {
+  const box = $('filter')
+  if (!state.tag) { box.hidden = true; box.replaceChildren(); return }
+  box.hidden = false
+  const chip = el('button', {
+    class: 'chip on', title: 'show everything again',
+    onclick: () => setTag(null),
+  }, el('span', { text: '#' + state.tag }), el('span', { class: 'x', text: '\u00d7' }))
+  box.replaceChildren(chip, el('span', {
+    class: 'dim', text: `${visibleGroups().length} of ${state.groups.length}`,
+  }))
+}
+
 function render() {
   renderCities()
   renderWhen()
   renderIdent()
+  renderFilter()
   renderRunInfo()
   const list = $('list')
   list.replaceChildren()
+  const groups = visibleGroups()
   let lastDay = ''
-  for (const g of state.groups) {
+  for (const g of groups) {
     const e = g.canonical
     const day = fmtDay(e.start)
     if (day !== lastDay) { list.append(el('li', { class: 'daysep', text: day })); lastDay = day }
     list.append(renderCard(g))
   }
   const win = timeWindow(state.when)
-  $('empty').hidden = state.groups.length > 0
+  $('empty').hidden = groups.length > 0
   $('empty').replaceChildren(
-    el('p', { text: `Nothing on the relays for ${currentPlace().name} ${win.label}.` }),
-    el('p', { class: 'dim', text: 'That is the normal state for a city nobody has scouted yet. A scouting run below fills it for everyone.' }),
+    state.tag && state.groups.length
+      ? el('p', { text: `Nothing tagged #${state.tag} in ${currentPlace().name} ${win.label}.` })
+      : el('p', { text: `Nothing on the relays for ${currentPlace().name} ${win.label}.` }),
+    state.tag && state.groups.length
+      ? el('button', { class: 'linkish', text: `show all ${state.groups.length} events again`, onclick: () => setTag(null) })
+      : el('p', { class: 'dim', text: 'That is the normal state for a city nobody has scouted yet. A scouting run below fills it for everyone.' }),
   )
 }
 
@@ -325,8 +359,13 @@ function renderCard(group) {
   if (km !== null) meta.push(km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`)
   if (group.copies.length > 1) meta.push(`${group.copies.length} sources`)
 
+  // "going" is a public NIP-52 RSVP plus a reaction, signed by whatever key
+  // the visitor has here - so say so, rather than leaving a bare verb.
   const going = el('button', {
     class: 'going' + (end.mine ? ' on' : ''),
+    title: end.mine
+      ? 'you published an RSVP for this'
+      : `RSVP publicly (NIP-52) as ${state.identity ? state.identity.npub.slice(0, 9) + '…' : 'your key'}`,
     onclick: () => onGoing(group, going),
   }, el('span', { text: end.mine ? 'going ✓' : 'going' }))
 
@@ -342,7 +381,12 @@ function renderCard(group) {
       e.summary ? el('p', { class: 'summary', text: e.summary.slice(0, 220) }) : null,
       el('p', { class: 'meta', text: meta.join(' · ') }),
       el('p', { class: 'tags' },
-        ...displayTags(e, place).map(t => el('span', { class: 'tag', text: '#' + t })),
+        ...displayTags(group, place).map(t => el('button', {
+          class: 'tag' + (t === state.tag ? ' on' : ''),
+          title: t === state.tag ? 'show every event again' : `only events tagged #${t}`,
+          onclick: () => setTag(t),
+          text: '#' + t,
+        })),
       ),
       el('p', { class: 'actions' },
         going,
@@ -355,16 +399,24 @@ function renderCard(group) {
 }
 
 // The city tags are what made the event findable; on a page that is already
-// showing one city they are noise.
-function displayTags(e, place) {
+// showing one city they are noise. Everything else is a filter handle, so the
+// card shows the tags of every copy, and the active one is never cut off by
+// the four-tag cap.
+function displayTags(group, place) {
   const hidden = new Set([slugify(place.name), place.name.toLowerCase()])
   const seen = new Set()
-  return e.hashtags.filter(t => {
+  const tags = []
+  for (const t of [...group.canonical.hashtags, ...group.copies.flatMap(c => c.hashtags)]) {
     const key = slugify(t)
-    if (hidden.has(t.toLowerCase()) || hidden.has(key) || seen.has(key)) return false
+    if (!key || hidden.has(t.toLowerCase()) || hidden.has(key) || seen.has(key)) continue
     seen.add(key)
-    return true
-  }).slice(0, 4)
+    tags.push(key)
+  }
+  if (state.tag && tags.includes(state.tag)) {
+    tags.splice(tags.indexOf(state.tag), 1)
+    tags.unshift(state.tag)
+  }
+  return tags.slice(0, 4)
 }
 
 function sourceLabel(url) {

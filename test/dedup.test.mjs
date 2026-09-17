@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { dedupId, groupCopies, sameEvent, normalizeTitle } from '../src/events.js'
+import { dedupId, groupCopies, groupHasTag, groupTags, sameEvent, normalizeTitle } from '../src/events.js'
 
 const mk = (o) => ({ id: o.id || Math.random().toString(36).slice(2), d: o.d || '', address: o.address || '',
   title: o.title, venue: o.venue || '', start: o.start, coords: o.coords || null, refs: o.refs || [],
@@ -48,3 +48,20 @@ assert.equal(sameEvent(f1, f2), true, 'same concert, two publishers, different w
 const f3 = mk({ title: 'Sonntagsmatinee: Mozart Klavierkonzerte', venue: 'Prinzregententheater', start: 1789200000 })
 assert.equal(sameEvent(f1, f3), false, 'different programme in the same hall stays separate')
 console.log('dedup tests ok (extended)')
+
+// tag filter: a group answers for the tags of every copy, folded to slugs
+const t1 = mk({ title: 'Kammerorchester Schubert', venue: 'Prinzregententheater', start: 1789200000 })
+t1.hashtags = ['Konzert', 'München']
+const t2 = mk({ title: 'Kammerorchester - Schubert', venue: 'Prinzregententheater München', start: 1789200300 })
+t2.hashtags = ['concert', 'klassik']
+const t3 = mk({ title: 'Open-Air-Kino', venue: 'Westpark', start: 1789200000 })
+t3.hashtags = ['cinema']
+const tg = groupCopies([t1, t2, t3])
+const concertGroup = tg.find(g => g.copies.length === 2)
+assert.deepEqual([...groupTags(concertGroup)].sort(), ['concert', 'klassik', 'konzert', 'munchen'])
+assert.equal(groupHasTag(concertGroup, 'concert'), true, 'the copy tag filters the whole group')
+assert.equal(groupHasTag(concertGroup, 'Konzert'), true, 'filtering folds case and umlauts')
+assert.equal(groupHasTag(concertGroup, 'cinema'), false)
+assert.equal(groupHasTag(concertGroup, null), true, 'no filter keeps everything')
+assert.equal(tg.filter(g => groupHasTag(g, 'concert')).length, 1, 'filtering a list keeps one card')
+console.log('tag filter tests ok')

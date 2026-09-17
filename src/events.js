@@ -127,6 +127,24 @@ export function groupCopies(parsed) {
   })
 }
 
+// Tags are what made an event findable, so they are also the facet worth
+// clicking. A group carries the tags of every copy: the magazine's "konzert"
+// and the ticket shop's "concert" both lead to the same card, and a filter on
+// either one keeps it.
+export function groupTags(group) {
+  const out = new Set()
+  for (const c of group.copies) for (const t of c.hashtags || []) {
+    const slug = slugify(t)
+    if (slug) out.add(slug)
+  }
+  return out
+}
+
+export function groupHasTag(group, tag) {
+  if (!tag) return true
+  return groupTags(group).has(slugify(tag))
+}
+
 const TOLERANCE_SECONDS = 1800
 const TOLERANCE_KM = 0.3
 
