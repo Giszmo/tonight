@@ -6,7 +6,7 @@ import {
   missingAngles, pageOf,
 } from '../src/scout.js'
 import { htmlToText, readPage, PageUnavailable } from '../src/reader.js'
-import { InsufficientBalance } from '../src/ppq.js'
+import { InsufficientBalance, keyName, KEY_NAME_MAX } from '../src/ppq.js'
 
 // ---------- parsing ----------
 
@@ -510,5 +510,14 @@ await geocode('Volkstheater', 'München')
 await geocode('Blitz', 'München')
 assert.equal(lookups, 2, 'venues are memoised and the total is capped')
 assert.equal(await makeGeocoder({ enabled: false })('Gasteig', 'München'), null)
+
+// Pasting an existing credit id mints a capped sub-key, and PPQ rejects a key
+// name over 25 characters with a 400 - which "tonight-events-page-" plus a
+// random suffix was, so adoption failed for everyone who tried it.
+for (const r of [Math.random(), 0.1, 0.999999]) {
+  assert.ok(keyName(r).length <= KEY_NAME_MAX, `key name fits: ${keyName(r)}`)
+  assert.ok(keyName(r).length > 8, 'and still has a unique suffix, or a second adoption is a 409')
+}
+assert.notEqual(keyName(0.1), keyName(0.2))
 
 console.log('scout tests ok')

@@ -59,9 +59,15 @@ export async function ensureAccount() {
 // /keys answers wrapped ({status, data:{api_key}}) - reading the top level here
 // yields undefined and the page then fails every later call as unauthorized.
 // And key names are unique per credit id, so a fixed name makes the second
-// adoption a 409.
+// adoption a 409 - while a name over 25 characters is a 400, which is what
+// "tonight-events-page-xxxxxx" was.
+export const KEY_NAME_MAX = 25
+export function keyName(rnd = Math.random()) {
+  return ('tonight-' + rnd.toString(36).slice(2, 8)).slice(0, KEY_NAME_MAX)
+}
+
 export async function adoptCreditId(creditId, { capUsd = 1 } = {}) {
-  const name = 'tonight-events-page-' + Math.random().toString(36).slice(2, 8)
+  const name = keyName()
   const res = await call('/keys', { creditId, body: { name, usage_limit_usd: capUsd } })
   const data = res?.data || res
   const apiKey = data?.api_key || data?.key || data?.apiKey
