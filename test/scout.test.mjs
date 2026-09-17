@@ -3,9 +3,9 @@ import {
   parseCandidates, parseHarvest, parseSources, buildHarvestMessages, buildSourceMessages, SOURCE_ANGLES,
   repairTruncatedJson,
   findDuplicate, runScout, makeGeocoder, zonedToSeconds, validZone, shortUrl,
-  missingAngles, pageOf, dayZoneForLongitude, parentListing,
+  missingAngles, pageOf, dayZoneForLongitude, parentListing, matchCitySlug, seedSources,
 } from '../src/scout.js'
-import { htmlToText, readPage, PageUnavailable, SLICE_CHARS } from '../src/reader.js'
+import { htmlToText, readPage, extractJsonLdEvents, PageUnavailable, SLICE_CHARS } from '../src/reader.js'
 import { InsufficientBalance, keyName, KEY_NAME_MAX, getBalance } from '../src/ppq.js'
 import { isDatedUrl } from '../src/main.js'
 
@@ -463,7 +463,8 @@ run = await runScout({}, {
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
   sources: [{ url: HUB, name: 'Stadtportal', kind: 'city' }],
   api: pageApi,
-  fetchPage: async (u) => { fetched.push(u); if (!pages[u]) throw new PageUnavailable(u, '404'); return pages[u] },
+  // Only the text fetches: the schema.org probe asks the same seam for HTML.
+  fetchPage: async (u, o) => { if (!o?.html) fetched.push(u); if (!pages[u]) throw new PageUnavailable(u, '404'); return pages[u] },
 })
 assert.deepEqual(fetched, [HUB, LIST, LIST + '?seite=2'], 'the hub is followed to the listing and then paginated')
 assert.deepEqual(run.candidates.map(c => c.title), ['Konzert', 'Lesung'])
@@ -498,7 +499,7 @@ assert.deepEqual(run.productive.map(s => s.url), [LIST, LIST + '?seite=2'],
         return JSON.stringify({ tz: 'UTC', events: [ev('Film ' + body[0])] })
       },
     }),
-    fetchPage: async () => { fetches++; return whole },
+    fetchPage: async (u, o) => { if (!o?.html) fetches++; return whole },
   })
   assert.deepEqual(seen, ['A', 'B', 'C'], 'every slice of the programme is read, not just the first')
   assert.equal(fetches, 1, 'a long page is fetched once and sliced, not re-fetched per slice')
@@ -684,7 +685,7 @@ assert.equal(parentListing('not a url'), null)
   const upRun = await runScout({}, {
     city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
     sources: [{ url: DEEP, name: 'Kinoprogramm', kind: 'cinema' }],
-    fetchPage: async (u) => { fetched.push(u); if (!pages[u]) throw new PageUnavailable(u, '404'); return pages[u] },
+    fetchPage: async (u, o) => { if (!o?.html) fetched.push(u); if (!pages[u]) throw new PageUnavailable(u, '404'); return pages[u] },
     api: fakeApi({
       answer: (p) => {
         const url = (p.match(/--- page text of (\S+) ---/) || [])[1]
@@ -707,7 +708,7 @@ assert.equal(parentListing('not a url'), null)
   const climbRun = await runScout({}, {
     city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
     sources: [{ url: 'https://x.test/a/b/c', name: 'Deep', kind: 'cinema' }],
-    fetchPage: async (u) => { fetched.push(u); return 'nothing here' },
+    fetchPage: async (u, o) => { if (!o?.html) fetched.push(u); return 'nothing here' },
     api: fakeApi({ answer: (p) => /--- page text of/.test(p) ? JSON.stringify({ tz: 'UTC', events: [] }) : harvest([]) }),
   })
   assert.deepEqual(fetched, ['https://x.test/a/b/c', 'https://x.test/a/b'], 'one level up, once')
@@ -730,3 +731,189 @@ for (const u of [
 ]) assert.ok(!isDatedUrl(u), `stays true tomorrow: ${u}`)
 
 console.log('dated url tests ok')
+
+// ---------- schema.org on the page ----------
+
+// A listing that prints a title and a venue and no clock time cannot be
+// extracted at any price. The event's own page usually carries the time twice:
+// once for a reader, once for a search engine.
+{
+  const html = `<html><head>
+    <script type="application/ld+json">{"@context":"https://schema.org","@graph":[
+      {"@type":"Organization","name":"Mato"},
+      {"@type":"WebSite","url":"https://ma.to"}]}</script>
+    <script type="application/ld+json">{"@context":"https://schema.org","@type":"Event",
+      "name":"Kundun - Scorsese","startDate":"2026-09-20T19:30:00.000+01:00",
+      "endDate":"2026-09-20T21:45:00.000+01:00","description":"Scorsese's spiritual epic.",
+      "location":{"@type":"Place","name":"Cinemateca Portuguesa",
+        "address":{"@type":"PostalAddress","streetAddress":"Rua Barata Salgueiro 39","addressLocality":"Lisboa"}},
+      "url":"/event/kundun"}</script>
+    <script type="application/ld+json">{"@type":"ScreeningEvent","name":"Cancelado",
+      "startDate":"2026-09-20T20:00+01:00","eventStatus":"https://schema.org/EventCancelled"}</script>
+    <script type="application/ld+json">{"@type":"MusicEvent","name":"Fado",
+      "startDate":"2026-09-20T22:00+01:00","location":"Pavilhão Chinês"}</script>
+    <script type="application/ld+json">not json at all</script>
+    </head><body>Kundun</body></html>`
+  const found = extractJsonLdEvents(html, 'https://ma.to/event/kundun')
+  assert.deepEqual(found.map(e => e.title), ['Kundun - Scorsese', 'Fado'],
+    'organisations are not events, and a cancelled show is worse than no show')
+  assert.equal(found[0].venue, 'Cinemateca Portuguesa')
+  assert.equal(found[0].address, 'Rua Barata Salgueiro 39 Lisboa')
+  assert.equal(found[0].url, 'https://ma.to/event/kundun', 'a relative url is resolved against the page')
+  assert.equal(found[1].category, 'concert', 'the schema subtype is a free category')
+  // The stamp carries its own offset, so it needs no zone from the model.
+  assert.deepEqual(parseCandidates(JSON.stringify({ events: found })).map(c => c.start),
+    [Math.floor(Date.parse('2026-09-20T18:30:00Z') / 1000), Math.floor(Date.parse('2026-09-20T21:00:00Z') / 1000)])
+  assert.deepEqual(extractJsonLdEvents('<html><body>no structured data</body></html>'), [],
+    'most pages have none, and that is not an error')
+}
+
+// ...and the run goes looking for it exactly when the page read as empty, which
+// is the only time the answer can change anything. A page that yielded events is
+// never asked for a second time: the reader is shared and it rate-limits.
+{
+  const ld = (name, when) => '<html><script type="application/ld+json">' +
+    `{"@type":"Event","name":"${name}","startDate":"${when}","location":{"@type":"Place","name":"Sala"}}</script></html>`
+  const EMPTY = 'https://cartaz.test/cinema', FULL = 'https://full.test/today'
+  const probed = []
+  const ldRun = await runScout({}, {
+    city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+    sources: [{ url: EMPTY, name: 'Cartaz', kind: 'cinema' }, { url: FULL, name: 'Full', kind: 'city' }],
+    fetchPage: async (u, o) => {
+      // (the seed index asks for HTML too; it is not a page under test)
+      if (o?.html) { if (!/ma\.to/.test(u)) probed.push(u); return ld('Kundun', '2026-09-20T19:30:00Z') }
+      return u === FULL ? 'Happy End 20:00' : 'a list of films and no times at all'
+    },
+    api: fakeApi({ answer: (p) => (p.includes(FULL)
+      ? JSON.stringify({ tz: 'UTC', events: [ev('Happy End')] })
+      : harvest([])) }),
+  })
+  assert.deepEqual(ldRun.candidates.map(c => c.title).sort(), ['Happy End', 'Kundun'],
+    'the empty page is rescued by its own schema.org')
+  assert.deepEqual(probed, [EMPTY], 'and the page that already paid off is not fetched a second time')
+  assert.deepEqual(ldRun.barren, [], 'a page rescued that way is not filed as barren')
+  assert.ok(ldRun.productive.some(s => s.url === EMPTY), 'it goes to the registry like any other catalogue')
+}
+
+console.log('schema.org tests ok')
+
+// ---------- entries whose time is one click away ----------
+
+{
+  const LIST = 'https://ma.test/events/lisbon/today/film'
+  const A = 'https://ma.test/event/kundun', B = 'https://ma.test/event/aviator'
+  const pages = {
+    [LIST]: 'Kundun · Cinemateca\nThe Aviator · Cinemateca',
+    [A]: 'Kundun\nWhen\nSunday, 20 September\n19:30\nCinemateca',
+    [B]: 'The Aviator\nWhen\nSunday, 20 September\n21:00\nCinemateca',
+  }
+  const prompts = []
+  const detailRun = await runScout({}, {
+    city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+    sources: [{ url: LIST, name: 'Mato', kind: 'cinema' }],
+    // One request per page now, so the detail pages come back as HTML.
+    fetchPage: async (u, o) => (o?.html ? `<html><body>${pages[u] ?? ''}</body></html>` : pages[u] ?? ''),
+    api: fakeApi({ answer: (p) => {
+      prompts.push(p)
+      if (p.includes('one event each')) {
+        return JSON.stringify({ tz: 'UTC', events: [
+          { title: 'Kundun', start: '2026-09-20T19:30', venue: 'Cinemateca', url: A },
+          { title: 'The Aviator', start: '2026-09-20T21:00', venue: 'Cinemateca', url: B },
+        ] })
+      }
+      if (/--- page text of/.test(p)) return JSON.stringify({ tz: 'UTC', events: [], detail_urls: [A, B] })
+      return harvest([])
+    } }),
+  })
+  assert.deepEqual(detailRun.candidates.map(c => c.title), ['Kundun', 'The Aviator'],
+    'a listing with no times still yields its evening')
+  const detailPrompts = prompts.filter(p => p.includes('one event each'))
+  assert.equal(detailPrompts.length, 1, 'twelve entry pages are one call, not twelve')
+  assert.ok(detailPrompts[0].includes(A) && detailPrompts[0].includes(B),
+    'both pages are in the same message')
+  assert.deepEqual(detailRun.productive.map(s => s.url), [LIST],
+    'the listing is what the registry keeps, not the twelve pages under it')
+  assert.deepEqual(detailRun.barren, [], 'and it is not filed as a page with nothing on it')
+}
+
+{
+  // A detail page that carries schema.org costs nothing at all.
+  const LIST = 'https://ma.test/events/porto/today'
+  const A = 'https://ma.test/event/fado'
+  const detailPrompts = []
+  const freeRun = await runScout({}, {
+    city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+    sources: [{ url: LIST, name: 'Mato', kind: 'magazine' }],
+    fetchPage: async (u, o) => {
+      if (o?.html) {
+        return u === A
+          ? '<html><script type="application/ld+json">{"@type":"MusicEvent","name":"Fado",' +
+            '"startDate":"2026-09-20T22:00:00Z","location":{"@type":"Place","name":"Pavilhão"}}</script></html>'
+          : '<html></html>'
+      }
+      return u === LIST ? 'Fado · Pavilhão' : ''
+    },
+    api: fakeApi({ answer: (p) => {
+      if (p.includes('one event each')) { detailPrompts.push(p); return harvest([]) }
+      if (/--- page text of/.test(p)) return JSON.stringify({ tz: 'UTC', events: [], detail_urls: [A] })
+      return harvest([])
+    } }),
+  })
+  assert.deepEqual(freeRun.candidates.map(c => c.title), ['Fado'])
+  assert.equal(detailPrompts.length, 0, 'a page that dates itself in schema.org is never sent to the model')
+}
+
+console.log('detail page tests ok')
+
+// ---------- catalogues nobody has to search for ----------
+
+// The city picker says "Lisboa" because OpenStreetMap does; an aggregator says
+// "lisbon" because it is written in English. One edit apart, agreeing on their
+// first five letters, is a match; two edits is a different city.
+const SLUGS = ['lisbon', 'porto', 'san-jose', 'san-juan', 'sao-paulo', 'koln', 'cologne']
+assert.equal(matchCitySlug(SLUGS, ['Porto']), 'porto', 'exact first')
+assert.equal(matchCitySlug(SLUGS, ['Lisboa']), 'lisbon')
+assert.equal(matchCitySlug(SLUGS, ['São Paulo']), 'sao-paulo', 'accents are stripped before comparing')
+assert.equal(matchCitySlug(SLUGS, ['San José']), 'san-jose')
+assert.equal(matchCitySlug(SLUGS, ['San Juao']), 'san-juan', 'one edit, one candidate')
+// Santa Maria and Santa Marta are different cities on different continents, so
+// a name one edit from both is a coin toss and gets no catalogue at all.
+assert.equal(matchCitySlug(['santa-maria', 'santa-marta'], ['Santa Marja']), null)
+assert.equal(matchCitySlug(SLUGS, ['München']), null, 'an exonym that shares nothing stays unmatched')
+assert.equal(matchCitySlug(SLUGS, ['Ulm']), null, 'a short name is never matched loosely')
+
+{
+  const index = '<a href="/events/lisbon">Lisbon</a><a href="/events/porto">Porto</a>'
+  const seeds = [{
+    name: 'Mato', kind: 'magazine', index: 'https://ma.test/cities',
+    slugs: (t) => [...String(t).matchAll(/\/events\/([a-z][a-z0-9-]{1,40})(?=["\s])/g)].map(m => m[1]),
+    page: (slug) => `https://ma.test/events/${slug}/today`, covers: 'today',
+  }]
+  assert.deepEqual((await seedSources(['Lisboa'], { fetchHtml: async () => index, seeds })).map(s => s.url),
+    ['https://ma.test/events/lisbon/today'])
+  assert.deepEqual(await seedSources(['Testheim'], { fetchHtml: async () => index, seeds }), [],
+    'a city the aggregator does not cover seeds nothing')
+  assert.deepEqual(await seedSources(['Lisboa'], { fetchHtml: async () => { throw new Error('down') }, seeds }), [],
+    'an index that will not load is not a run-stopping error')
+}
+
+console.log('seed catalogue tests ok')
+
+// ---------- links survive the text ----------
+
+// A direct fetch used to lose every href, so an event had no URL to be
+// published with and a card grid had no way to reach the page that holds its
+// times. The reader's markdown keeps them; this now matches it.
+{
+  const html = '<ul><li><a href="/event/kundun">Kundun</a> · Cinemateca</li>' +
+    '<li><a href=\'https://other.test/x\'>Away</a></li>' +
+    '<li><a href="#top">to the top</a> <a href="mailto:a@b.c">write us</a></li></ul>'
+  const text = htmlToText(html, 'https://ma.to/events/lisbon/today')
+  assert.ok(text.includes('[Kundun](https://ma.to/event/kundun)'), 'a relative href is made absolute')
+  assert.ok(text.includes('[Away](https://other.test/x)'))
+  assert.ok(!text.includes('#top') && text.includes('to the top'), 'an anchor to nowhere is just its words')
+  assert.ok(!text.includes('mailto:') && text.includes('write us'))
+  assert.equal(htmlToText('<a href="/x">Y</a>'), '[Y](/x)', 'without a base the href is left as written')
+}
+
+console.log('link preservation tests ok')

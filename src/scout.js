@@ -15,7 +15,7 @@
 import { InsufficientBalance } from './ppq.js'
 import { dedupId, buildEventTags, cityTags, sameEvent, KIND_TIME_EVENT, KIND_SCOUT_RUN } from './events.js'
 import { encodeGeohash, geohashPrefixes, slugify, geocodePlace } from './geo.js'
-import { readPage, sameHost, absolute, SLICE_CHARS } from './reader.js'
+import { readPage, readHtml, htmlToText, extractJsonLdEvents, sameHost, absolute, SLICE_CHARS } from './reader.js'
 
 export const MAX_PER_CALL = 60          // events we ask for in one harvest call
 export const MAX_PAGES_PER_SOURCE = 4   // pages of one listing we follow
@@ -25,6 +25,9 @@ export const CONCURRENCY = 3            // catalogues read at the same time
 export const FALLBACK_CALL_COST = 0.02  // used only until a run has measured one
 export const EXTRACT_TOKENS = 16000     // a city-wide cinema listing is 200 showings
 export const SEARCH_TOKENS = 8000
+export const MAX_DETAIL_PAGES = 10      // event pages opened off one listing, all in one call
+export const DETAIL_CHARS = 5000        // how much of one event page that call is shown
+export const MAX_DETAIL_JOBS = 3        // ...and how many listings in a run get that call at all
 export const MAX_EXPANSIONS = 2         // extra catalogue searches when the budget outlasts the queue
 export const EXPAND_BELOW = 0.6         // ...and only while this much of it is still unspent
 
@@ -222,6 +225,76 @@ export function parseSources(text, { perHost = MAX_SOURCES_PER_HOST } = {}) {
     })
 }
 
+// ---------- catalogues nobody has to search for ----------
+//
+// Discovery asks a search engine, and a search engine returns what ranks. It
+// found six Lisbon catalogues and not ma.to, which had twelve films on for that
+// evening in a city where our run published two. Some aggregators cover dozens
+// of cities behind one predictable URL, so for those the right move is not to
+// search at all: read their own list of cities and go straight to the page.
+// Free - it costs fetches, not calls - and it is the same thing a person adding
+// a catalogue by hand does, just without the person.
+export const SEED_CATALOGUES = [
+  {
+    name: 'Mato',
+    kind: 'magazine',
+    index: 'https://ma.to/cities',
+    // Their city list is the authority on which slug this city has; guessing it
+    // from the name is how you end up fetching a different continent.
+    slugs: (text) => [...String(text).matchAll(/\/events\/([a-z][a-z0-9-]{1,40})(?=[")\s\]])/g)].map(m => m[1]),
+    page: (slug) => `https://ma.to/events/${slug}/today`,
+    covers: 'what is on in this city today - music, film, art, nightlife',
+  },
+]
+
+// Levenshtein, capped: only ever asked whether two city names are one edit
+// apart.
+function editDistance(a, b) {
+  if (Math.abs(a.length - b.length) > 1) return 2
+  let row = Array.from({ length: b.length + 1 }, (_, i) => i)
+  for (let i = 1; i <= a.length; i++) {
+    const next = [i]
+    for (let j = 1; j <= b.length; j++) {
+      next[j] = Math.min(next[j - 1] + 1, row[j] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+    }
+    row = next
+  }
+  return row[b.length]
+}
+
+// The city picker says "Lisboa", because that is what OpenStreetMap calls it;
+// ma.to says "lisbon", because it is written in English. An exact match on the
+// name would lose every city whose English exonym differs from its own name -
+// Munich, Cologne, Florence, Vienna. So an exact match first, then one edit,
+// and only when the two names already agree on their first five letters:
+// "lisboa"/"lisbon" is one edit, "san-jose"/"san-juan" is two and stays out.
+export function matchCitySlug(slugs, names) {
+  const wanted = [...new Set(names.map(n => slugify(n)).filter(Boolean))]
+  const list = [...new Set(slugs)]
+  for (const w of wanted) if (list.includes(w)) return w
+  for (const w of wanted) {
+    if (w.length < 5) continue
+    const near = list.filter(s => s.length >= 5 && s.slice(0, 5) === w.slice(0, 5) && editDistance(s, w) <= 1)
+    // Two candidates one edit away is not a match, it is a coin toss.
+    if (near.length === 1) return near[0]
+  }
+  return null
+}
+
+// The index is read as HTML, not as text: the slugs are in the hrefs, and both
+// the plain-text path and the reader's markdown throw the links away.
+export async function seedSources(names, { fetchHtml = readHtml, seeds = SEED_CATALOGUES } = {}) {
+  const out = []
+  await Promise.all(seeds.map(async (seed) => {
+    try {
+      const slug = matchCitySlug(seed.slugs(await fetchHtml(seed.index)), names)
+      if (!slug) return
+      out.push({ name: seed.name, url: seed.page(slug), kind: seed.kind, covers: seed.covers, seeded: true })
+    } catch { /* a seed that will not load is simply not a seed today */ }
+  }))
+  return out
+}
+
 // ---------- stage 2: walk one catalogue ----------
 
 // Two shapes of the same question. When we managed to fetch the page, the page
@@ -231,19 +304,35 @@ export function parseSources(text, { perHost = MAX_SOURCES_PER_HOST } = {}) {
 // search-backed form.
 export function buildHarvestMessages({
   city, country, from, to, source, known = [], page = 1, after = null, pageText = null, url = null,
-  offset = 0, tz = null,
+  offset = 0, tz = null, detail = false,
 }) {
   const where = `${city}${country ? ', ' + country : ''}`
   const shape =
     `Return up to ${MAX_PER_CALL} events as JSON in exactly this shape:\n` +
     `{"tz":"IANA timezone of ${city}","events":[${EVENT_SHAPE}],` +
-    '"listing_urls":[],"next_url":"","more":true|false,"covered_until":"YYYY-MM-DDTHH:MM"}\n' +
+    '"listing_urls":[],"detail_urls":[],"next_url":"","more":true|false,"covered_until":"YYYY-MM-DDTHH:MM"}\n' +
     `Times in "start", "end" and "covered_until" are ${city}'s own wall clock, and "tz" says which zone that is ` +
     '(for example "Europe/Berlin"). Omit any event whose date or venue you are not sure about.'
   const skip = known.length ? `Already published, skip these (times in UTC):\n${knownBlock(known)}\n` : ''
   const oneEntry = 'One entry per event date: a run of performances on five evenings is five entries.\n'
 
-  const content = pageText
+  // One call over a dozen event pages, not a dozen calls. Each page is one
+  // event, so the model is told to answer with one entry per block rather than
+  // hunting a listing.
+  const detailContent = () =>
+    `Below are ${where} event pages, one event each, fetched moments ago. Report every event that starts ` +
+    `between ${fmtStamp(from)} and ${fmtStamp(to)}; leave out the ones outside that window.\n` +
+    'Use only what is written in each block. Do not search, do not recall. Give each event the URL of its own ' +
+    'block, which is printed above it.\n' +
+    `Today is ${fmtCityDay(from, tz)} in ${city}. A page that gives a time but no date is about today.\n` +
+    'Ignore the "related events" or "you might also like" lists these pages carry: report the event the page ' +
+    'is about, not its neighbours.\n' +
+    skip + shape +
+    `\n\n${pageText}`
+
+  const content = detail
+    ? detailContent()
+    : pageText
     ? `Extract every public event in ${where} that starts between ${fmtStamp(from)} and ${fmtStamp(to)} ` +
       `from the page below. It was fetched from ${url} moments ago.\n` +
       'Use only what is in the page. Do not search, do not recall, do not add anything that is not written there. ' +
@@ -268,6 +357,13 @@ export function buildHarvestMessages({
       'If this page is an index or hub that links to listings instead of listing events itself, return no events ' +
       'and put the URLs of its actual listing pages (a today/this week/calendar view, per-category calendars, or ' +
       'a complete-programme page such as "all cinemas", "all films" or "full schedule") into "listing_urls".\n' +
+      // An index names the show and the venue and nothing else; the time is one
+      // click away on the event's own page. cartazculturallisboa.pt's film index
+      // is 204 links and one clock time in the whole page, so it is
+      // unextractable however well we found it - unless we open what it links to.
+      'Some listings name an event and its venue but print no time for it at all, because the time is only on that ' +
+      'event\'s own page. Put the links of those entries - and only those - into "detail_urls". An entry you could ' +
+      'read a time for belongs in "events", not there.\n' +
       'If the listing is paginated and continues, put the URL of the next page into "next_url".\n' +
       skip + shape +
       `\n\n--- page text of ${url} ---\n${pageText}\n--- end of page ---`
@@ -312,6 +408,12 @@ export function parseHarvest(text, { tz = null, base = null } = {}) {
     // Only links on the same host: a hub's "listings" often include ad targets,
     // and following those spends the visitor's money on a ticket shop's banner.
     listingUrls: (Array.isArray(obj.listing_urls) ? obj.listing_urls : []).map(link).filter(Boolean).slice(0, 8),
+    detailUrls: (Array.isArray(obj.detail_urls) ? obj.detail_urls : [])
+      .map(link).filter(Boolean)
+      // A listing's own URL is not one of its entries; following it would cost
+      // a call to read the page we just read.
+      .filter(u => !base || pageOf(u) !== pageOf(base))
+      .slice(0, MAX_DETAIL_PAGES),
     nextUrl: link(obj.next_url),
   }
 }
@@ -428,7 +530,7 @@ export function parentListing(url) {
 
 // A run now visits several pages of the same host, so the host alone stops
 // telling the visitor which page a batch of events came from.
-const visitKey = (job) => `${String(job.url || '').replace(/#.*$/, '')}|${job.page}`
+const visitKey = (job) => `${String(job.url || '').replace(/#.*$/, '')}|${job.page}${job.detail ? '|details' : ''}`
 
 export function shortUrl(url, max = 38) {
   try {
@@ -563,6 +665,20 @@ export async function runScout(acc, {
 
   const urlKey = (u) => String(u || '').replace(/#.*$/, '').replace(/\/$/, '')
 
+  // Aggregators that publish their own list of cities need no search at all -
+  // see SEED_CATALOGUES. This is fetches, not calls, so it happens whatever the
+  // budget is and before anything is paid for.
+  const seeded = (await seedSources([city], { fetchHtml: (u) => fetchPage(u, { html: true }) }).catch(() => []))
+    .filter(s => !usedSources.some(k => urlKey(k.url) === urlKey(s.url)))
+  if (seeded.length) {
+    usedSources = [...usedSources, ...seeded]
+    progress({
+      phase: 'sources',
+      sources: usedSources.slice(),
+      label: `${seeded.map(s => s.name).join(', ')} already covers ${city} - no search needed for that one`,
+    })
+  }
+
   async function discoverSources(exclude, label, angles = SOURCE_ANGLES) {
     progress({ phase: 'sources', label })
     const perAngle = await Promise.all(angles.map(async (angle) => {
@@ -603,16 +719,16 @@ export async function runScout(acc, {
   // the budget is. So when the city already has catalogues, the search goes
   // after the kinds it does not have rather than asking the same four questions
   // again.
-  const gaps = missingAngles(fromRegistry)
+  const gaps = missingAngles(usedSources)
   if (wantDiscovery) {
     const angles = fromRegistry.length && gaps.length ? gaps : SOURCE_ANGLES
-    const found = await discoverSources(fromRegistry, fromRegistry.length
+    const found = await discoverSources(usedSources, fromRegistry.length
       ? (gaps.length
         ? `${city} has no ${gaps.map(a => a.key).join(' and no ')} catalogue yet - looking`
         : `looking for catalogues beyond the ${fromRegistry.length} we know`)
       : 'looking for the catalogues that cover ' + city, angles)
     discovered.push(...found)
-    usedSources = [...found, ...fromRegistry]
+    usedSources = [...found, ...usedSources]
     progress({
       phase: 'sources',
       label: found.length
@@ -632,9 +748,160 @@ export async function runScout(acc, {
   const productive = new Map()   // pages that actually yielded events, for the registry
   const barren = new Map()       // ...and pages we read that had nothing on them
   const fetched = new Map()      // url -> the page's whole text, read once and sliced
+  const openedDetails = new Set() // event pages already opened off some listing
+  let detailJobs = 0
   let openWebRan = false
 
+  // Everything that comes back - paid or free - lands here, so the window
+  // filter and the two dedup passes are the same wherever a candidate came from.
+  function acceptAll(list, label) {
+    // An hour of slack for listings that round, no more: the window is what the
+    // visitor asked for and is paying for.
+    const inWindow = list.filter(c => c.start >= from - 3600 && c.start <= to + 3600)
+    let added = 0
+    for (const c of inWindow) {
+      if (findDuplicate(c, knownShapes)) continue
+      if (findDuplicate(c, accepted.map(candidateShape))) continue
+      accepted.push({ ...c, source: label })
+      added++
+    }
+    return { inWindow, added }
+  }
+
+  // schema.org events written into the page for search engines. Exact to the
+  // minute, carrying their own UTC offset, and free: no call, and nothing a
+  // model could invent. Most catalogue pages have none.
+  //
+  // It costs a second request for the same page, though, and the reader we all
+  // share rate-limits: probing every page speculatively earned a Lisbon run a
+  // wall of 429s and took its *text* fetches down with it. So a listing is only
+  // probed after it has come back empty - the only case where the answer can
+  // change anything - and once the reader has said 429 the run stops asking.
+  const structured = new Map()
+  let readerRefusing = false
+  const ldCandidates = (html, url) => extractJsonLdEvents(html, url)
+    .map(raw => normalizeCandidate(raw, cityZone))
+    .filter(Boolean)
+
+  async function structuredOn(url) {
+    if (!url || readerRefusing) return []
+    if (structured.has(url)) return structured.get(url)
+    let list = []
+    try {
+      list = ldCandidates(await fetchPage(url, { html: true }), url)
+    } catch (err) {
+      if (/\b429\b/.test(String(err?.message || ''))) readerRefusing = true
+    }
+    structured.set(url, list)
+    return list
+  }
+
+  // Ten event pages, one call. Each page is fetched for nothing; the ones that
+  // carry schema.org are read for nothing too, and only the rest are shown to
+  // the model - all of them in the same message, because ten calls for ten
+  // films would cost more than the listing they came from.
+  async function runDetailJob(job) {
+    // Nothing here is reachable without the reader, so a reader that is already
+    // refusing means ten wasted requests and a slower run for the pages that
+    // still matter.
+    if (readerRefusing) return
+    const urls = job.detail.filter(u => !openedDetails.has(u)).slice(0, MAX_DETAIL_PAGES)
+    if (!urls.length) return
+    for (const u of urls) openedDetails.add(u)
+    const from0 = shortUrl(job.url)
+    const id = `${from0}|details`
+    progress({ id, phase: 'fetch', label: `${urls.length} entries on ${from0} give no time - opening their own pages` })
+
+    // One request per page, not two: the HTML answers both questions - the
+    // schema.org block if there is one, and the page's own words if there is
+    // not. Ten pages at once would also be ten simultaneous requests to one
+    // site from one worker, which is what CONCURRENCY exists to prevent.
+    const opened = await inPool(urls, CONCURRENCY, async (u) => {
+      try {
+        const html = await fetchPage(u, { html: true })
+        return { url: u, events: ldCandidates(html, u), text: htmlToText(html, u) }
+      } catch (err) {
+        if (/\b429\b/.test(String(err?.message || ''))) readerRefusing = true
+        return null   // one page that will not load does not lose the batch
+      }
+    })
+    let added = 0, found = 0
+    const blocks = []
+    for (const page of opened) {
+      if (!page) continue
+      if (page.events.length) {
+        const r = acceptAll(page.events, shortUrl(page.url))
+        found += r.inWindow.length
+        added += r.added
+        continue
+      }
+      const text = page.text.slice(0, DETAIL_CHARS).trim()
+      if (text) blocks.push(`--- page text of ${page.url} ---\n${text}\n--- end of ${page.url} ---`)
+    }
+    if (added) progress({ id, phase: 'harvest', label: `${added} of them dated from the page itself, no call` })
+    if (!blocks.length || !affordable() || shouldStop()) {
+      progress({ id, phase: 'harvest', label: blocks.length
+        ? `${from0}: no budget left for its entry pages`
+        : `${from0}: ${added} events off its entry pages, ${added} new` })
+      if (added) markProductive(job, found)
+      return
+    }
+    // Never more than one slice, however many pages came back.
+    let size = blocks.reduce((n, b) => n + b.length, 0)
+    while (size > SLICE_CHARS && blocks.length > 1) size -= blocks.pop().length
+
+    progress({ id, phase: 'harvest', label: `reading ${blocks.length} event ${blocks.length === 1 ? 'page' : 'pages'} in one call` })
+    let entry
+    try {
+      const [res, call] = await paidCall(`${from0} (event pages)`, buildHarvestMessages({
+        city, country, from, to, source: job.source, detail: true,
+        pageText: blocks.join('\n\n'), url: job.url, tz: cityZone || dayZoneForLongitude(lon),
+        known: [...knownShapes, ...accepted.map(candidateShape)],
+      }), EXTRACT_TOKENS)
+      entry = call
+      const harvest = parseHarvest(res.text, { tz: cityZone, base: job.url })
+      if (harvest.tz) cityZone = harvest.tz
+      const r = acceptAll(harvest.candidates, `${from0} (event pages)`)
+      found += r.inWindow.length
+      added += r.added
+      if (entry) { entry.found = r.inWindow.length; entry.added = r.added }
+    } catch (err) {
+      if (err instanceof InsufficientBalance) { stoppedBecause = 'out of credit'; reasonIsFinal = true; throw err }
+      console.warn('detail harvest failed for ' + from0, err)
+      if (entry) entry.failed = true
+    }
+    progress({ id, phase: 'harvest', label: `${from0}: ${found} events off its entry pages, ${added} new` })
+    if (added) markProductive(job, found)
+  }
+
+  // Ordered, bounded, and every result kept: Promise.all on a dozen URLs is a
+  // dozen simultaneous requests to one host.
+  async function inPool(items, width, fn) {
+    const out = new Array(items.length)
+    let i = 0
+    await Promise.all(Array.from({ length: Math.min(width, items.length) }, async () => {
+      while (i < items.length) { const n = i++; out[n] = await fn(items[n]) }
+    }))
+    return out
+  }
+
+  // The listing is what the next visitor should find in the registry, even when
+  // the events were only readable one click further in.
+  function markProductive(job, found) {
+    if (!job.url) return
+    barren.delete(job.url)
+    const soFar = (productive.get(job.url)?.found || 0) + found
+    productive.set(job.url, {
+      url: job.url,
+      name: job.source?.name || hostOf(job.url),
+      kind: job.source?.kind || 'other',
+      covers: job.source?.covers || `${soFar} events in one listing`,
+      found: soFar,
+    })
+  }
+
   async function runJob(job) {
+    if (job.detail) return runDetailJob(job)
     // Keyed by page as well as URL: a second pass over the same listing is a
     // different question ("continue after X"), a second visit to the same first
     // page is not.
@@ -694,17 +961,19 @@ export async function runScout(acc, {
       return
     }
 
-    // An hour of slack for listings that round, no more: the window is what the
-    // visitor asked for and is paying for.
-    const inWindow = harvest.candidates.filter(c => c.start >= from - 3600 && c.start <= to + 3600)
-    let added = 0
-    for (const c of inWindow) {
-      if (findDuplicate(c, knownShapes)) continue
-      if (findDuplicate(c, accepted.map(candidateShape))) continue
-      accepted.push({ ...c, source: label })
-      added++
+    const harvested = acceptAll(harvest.candidates, label)
+    if (entry) { entry.found = harvested.inWindow.length; entry.added = harvested.added }
+
+    // The page read as empty. Before filing it as barren, look for the copy
+    // written for search engines: cartazculturallisboa.pt's film index is 204
+    // links and one clock time, and its schema.org block has the evening in it.
+    const free = acceptAll(
+      !harvested.inWindow.length && job.url && job.page === 1 && !offset ? await structuredOn(job.url) : [], label)
+    if (free.added) {
+      progress({ id, phase: 'harvest', label: `${label}: ${free.added} events read straight off the page, no call` })
     }
-    if (entry) { entry.found = inWindow.length; entry.added = added }
+    const inWindow = [...free.inWindow, ...harvested.inWindow]
+    const added = free.added + harvested.added
 
     // A hub - the section front page most catalogues advertise - lists no
     // events itself. It names the pages that do, and those are what the next
@@ -723,6 +992,22 @@ export async function runScout(acc, {
     }
 
     progress({ id, phase: 'harvest', label: `${label}: ${inWindow.length} events, ${added} new` })
+
+    // Entries that name an event and give no time. The time is on the event's
+    // own page, so those pages are opened - schema.org first, which is free,
+    // and whatever is left over goes into one call for all of them together.
+    const details = harvest.detailUrls.filter(u => !openedDetails.has(u) && !visited.has(visitKey({ url: u, page: 1 })))
+    // Capped per run, not just per listing: fifteen catalogues each claiming a
+    // handful of undated entries would be fifteen extra calls, and this is a
+    // rescue for listings that hold nothing otherwise, not a second pass over
+    // the whole city.
+    if (details.length && job.depth < 2 && detailJobs < MAX_DETAIL_JOBS) {
+      detailJobs++
+      queue.unshift({
+        source: job.source, url: job.url, page: 1, after: null, depth: job.depth + 1, detail: details,
+      })
+    }
+
     // A page we read and found nothing on is not a catalogue worth passing to
     // the next visitor. Publishing it anyway is worse than saying nothing: a
     // film page that renders its showtimes in the browser reads as empty here,
@@ -731,7 +1016,7 @@ export async function runScout(acc, {
     // A page we read and found nothing on may be one segment too deep - see
     // parentListing. One try, from a page we actually read, and never from a
     // page that is itself a parent we followed.
-    if (pageText && job.url && !inWindow.length && job.page === 1 && !offset && job.depth < 1) {
+    if (pageText && job.url && !inWindow.length && !details.length && job.page === 1 && !offset && job.depth < 1) {
       const up = parentListing(job.url)
       if (up && !visited.has(visitKey({ url: up, page: 1 }))) {
         queue.push({
@@ -741,19 +1026,9 @@ export async function runScout(acc, {
         progress({ id, phase: 'harvest', label: `${label}: nothing on it, trying ${shortUrl(up)}` })
       }
     }
-    if (added > 0 && job.url) {
-      barren.delete(job.url)
-      // A long listing is read in slices, so what it "covers" is every slice
-      // together, not whichever one finished last.
-      const soFar = (productive.get(job.url)?.found || 0) + inWindow.length
-      productive.set(job.url, {
-        url: job.url,
-        name: job.source?.name || hostOf(job.url),
-        kind: job.source?.kind || 'other',
-        covers: job.source?.covers || `${soFar} events in one listing`,
-        found: soFar,
-      })
-    }
+    // A long listing is read in slices, so what it "covers" is every slice
+    // together, not whichever one finished last.
+    if (added > 0 && job.url) markProductive(job, inWindow.length)
 
     // The rest of this same page comes first: it is already fetched, and it is
     // the one continuation we know for certain exists. A city film programme is

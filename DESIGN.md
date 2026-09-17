@@ -167,17 +167,59 @@ log, the candidate review, the dedup, the confetti — are driven end to end by
 `npm run e2e` in a real browser against a throwaway relay. It never touches the
 network and it is not reachable without the query parameter.
 
+## Where the events that are missing actually are
+
+Three measurements, all of them against the live web:
+
+1. **A listing can name an event and not date it.**
+   `cartazculturallisboa.pt/cinema-em-lisboa` is 204 links and **one clock time in
+   the whole page**: the times are on each film's own page. A listing like that is
+   unextractable however well it was found, so it is now allowed to answer with
+   `detail_urls` — the entries it can see but cannot date. Those pages are opened,
+   and they go to the model **in one call for all of them**, not one call each,
+   capped at three listings a run.
+2. **Some pages carry the answer in machine-readable form already.** Every ma.to
+   event page has a schema.org `Event` with `startDate` down to the minute and its
+   UTC offset. Reading it costs no call and cannot hallucinate. It needs the HTML,
+   though: the reader returns markdown and `htmlToText` strips `<script>`, so it is
+   a second request for the same page (`x-return-format: html`, same open CORS) —
+   and probing every page speculatively earned a run a wall of 429s from the reader
+   we all share, taking its *text* fetches down with it. So a listing is probed only
+   after it has come back empty, and the run stops asking once the reader refuses.
+   Counted before building it: of sixteen event pages across Lisbon and Munich,
+   only ma.to's event pages and Eventbrite's city listing have one. A free exact
+   bonus where it exists, never the reason a page is read.
+3. **Discovery only finds what ranks.** No Lisbon run ever surfaced ma.to, which
+   had twelve films on that evening in a city where our run published two, and
+   which covers 84 cities behind one predictable URL. Aggregators that publish their own
+   list of cities do not need a search at all — `SEED_CATALOGUES` reads that list
+   and goes straight to the page, for nothing. Matching the city to their slug is
+   the whole difficulty: the picker says "Lisboa" because OpenStreetMap does and
+   the aggregator says "lisbon" because it is written in English, so the match is
+   exact-or-one-edit with the first five letters agreeing, and an ambiguous match
+   is no match at all.
+
+And the fourth, which is not a trick: **anyone can add a catalogue**. The registry
+is a nostr event, so a page somebody local already reads every week goes in once
+and every future run in that city reads it — the same mechanism the seeds use and
+the same one a run's own findings use.
+
 ## Known limits
 
 - Coverage is bound by what a catalogue page shows to a fetcher. Server-rendered
   listings extract well; pages that build their programme in the browser do not,
   and cinema is the worst case — kino.de returns no showtimes even through a
   JS-rendering reader, so a city's film programme depends on finding a
-  server-rendered source. schema.org JSON-LD, ICS and RSS on venue pages are now
-  within reach through the same reader and are not yet used.
+  server-rendered source. ICS and RSS on venue pages are within reach through the
+  same reader and are not yet used.
 - The reader is a third party. It is a fallback with a direct fetch in front of
   it, and a page that will not load degrades to a web search rather than
   failing, but a run's completeness depends on a service nobody here operates.
+  It also *renders*, and that is load-bearing: ma.to writes its times into a
+  hydration payload, so the unrendered HTML has none and the reader's markdown
+  has all of them. A visitor is always on the reader path, because almost no
+  catalogue sends `access-control-allow-origin`; a node harness is on neither
+  unless it is told to be (`allowDirect: false`, which `test/live-run.mjs` sets).
 - Organiser claims and web-of-trust ranking are specified above but not built;
   the page counts raw endorsements and marks the ones from people you follow.
 - No recurrence support (NIP-52 has none yet).

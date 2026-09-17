@@ -1,7 +1,14 @@
 // A real scouting run against the real PPQ API and the real web.
 // Costs money. Usage: PPQ_KEY=sk-… node test/live-run.mjs "München" DE [budget] [hours]
 import { runScout } from '../src/scout.js'
+import { readPage } from '../src/reader.js'
 import * as ppq from '../src/ppq.js'
+
+// A browser is refused a direct fetch by almost every catalogue here and falls
+// through to r.jina.ai, which renders the page; node is refused by nobody and
+// would read the unrendered HTML instead. Measuring that would measure a path
+// no visitor is ever on - ma.to's listing has its times only after rendering.
+const asBrowser = (url, opts = {}) => readPage(url, { ...opts, allowDirect: false })
 
 const key = process.env.PPQ_KEY
 if (!key) throw new Error('PPQ_KEY required')
@@ -29,6 +36,7 @@ const t0 = Date.now()
 const run = await runScout(acc, {
   city, country, lat, lon, from: now, to,
   known: [], budgetUsd,
+  fetchPage: asBrowser,
   api: { getBalance: (a) => ppq.getBalance(a), chat: (a, o) => ppq.chat(a, o) },
   onProgress: (p) => { if (p.label) console.log(`  [${((Date.now() - t0) / 1000).toFixed(0)}s $${p.spent?.toFixed?.(4) ?? '?'}] ${p.label}`) },
 })
