@@ -271,6 +271,7 @@ export function parseSourceEvent(ev) {
     kind: tagValue(ev, 'source_kind') || 'other',
     covers: tagValue(ev, 'summary') || '',
     cities: ev.tags.filter(t => t[0] === 't').map(t => t[1]).filter(Boolean),
+    geohashes: ev.tags.filter(t => t[0] === 'g').map(t => t[1]).filter(Boolean),
     pubkey: ev.pubkey,
     createdAt: ev.created_at,
   }

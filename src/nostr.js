@@ -171,6 +171,7 @@ export async function fetchScoutRuns(city, { lat, lon } = {}) {
       model: (ev.tags.find(t => t[0] === 'model') || [])[1] || '',
       summary: ev.content,
       city: (ev.tags.find(t => t[0] === 't') || [])[1] || '',
+      geohashes: ev.tags.filter(t => t[0] === 'g').map(t => t[1]).filter(Boolean),
     }))
     .sort((a, b) => b.at - a.at)
 }

@@ -5,7 +5,7 @@ import {
   fetchSources, publishSources, publishRsvp, publish, getRelays, setRelays, DEFAULT_RELAYS,
 } from './nostr.js'
 import { groupCopies, groupHasTag } from './events.js'
-import { haversineKm, geocodeCity, slugify } from './geo.js'
+import { haversineKm, geocodeCity, slugify, encodeGeohash } from './geo.js'
 import * as realPpq from './ppq.js'
 import { mockPpq } from './mockppq.js'
 import {
@@ -272,9 +272,19 @@ function renderIdent() {
 // own events should also carry, or "Munich" and "München" become two listings
 // of the same evening.
 function cityAliases() {
-  const slug = slugify(currentPlace().name)
+  const place = currentPlace()
+  const slug = slugify(place.name)
+  // A catalogue is read back from a geohash cell wide enough to hold the next
+  // town over, so a name is only this city's other name when it was published
+  // for this city's own cell - otherwise Munich would start tagging its
+  // evenings "dachau".
+  const here = encodeGeohash(place.lat, place.lon, 5)
+  const sameCell = (x) => (x.geohashes || []).includes(here)
   const out = []
-  for (const name of [...state.sources.flatMap(s => s.cities || []), ...state.runs.map(r => r.city)]) {
+  for (const name of [
+    ...state.sources.filter(sameCell).flatMap(s => s.cities || []),
+    ...state.runs.filter(sameCell).map(r => r.city),
+  ]) {
     const t = slugify(name)
     if (t && t !== slug && !out.includes(t)) out.push(t)
   }
