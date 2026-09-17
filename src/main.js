@@ -481,12 +481,16 @@ const BUDGETS = [0.05, 0.25, 1]
 // What a city costs is not a guess: past runs recorded what they were charged
 // and how many events came back, so the offer is "this much money buys about
 // this many events" in the units the visitor is about to spend.
+// Pooled, not a median of ratios: one lucky run of four events for a third of a
+// cent extrapolates to hundreds per dollar, which is not a promise this page
+// should make. Quote a yield only once there is enough history to mean
+// something, and stay quiet otherwise.
 function eventsPerDollar() {
-  const rates = state.runs
-    .filter(r => r.costUsd > 0 && r.found > 0)
-    .slice(0, 8)
-    .map(r => r.found / r.costUsd)
-  return median(rates)
+  const runs = state.runs.filter(r => r.costUsd > 0 && r.found > 0).slice(0, 8)
+  const found = runs.reduce((a, r) => a + r.found, 0)
+  const cost = runs.reduce((a, r) => a + r.costUsd, 0)
+  if (runs.length < 2 || found < 10 || cost < 0.02) return null
+  return found / cost
 }
 
 async function onScout() {
