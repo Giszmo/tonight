@@ -217,9 +217,15 @@ const harvestCalls = run.calls.filter(c => !c.label.startsWith('catalogues'))
 assert.deepEqual(harvestCalls.map(c => c.label),
   ['one.test/events', 'two.test/events', 'one.test/events', 'open web'],
   'one.test is walked twice, two.test once, and the open search runs last')
-assert.deepEqual(run.calls.filter(c => c.label.startsWith('catalogues')).map(c => c.label.split(':')[1]),
-  [...SOURCE_ANGLES.map(a => a.key), ...SOURCE_ANGLES.map(a => a.key)],
-  'each angle is its own search, and the unspent budget buys one more round of them')
+const angleCalls = run.calls.filter(c => c.label.startsWith('catalogues')).map(c => c.label.split(':')[1])
+assert.deepEqual(angleCalls.slice(0, SOURCE_ANGLES.length), SOURCE_ANGLES.map(a => a.key),
+  'each angle is its own search')
+// The unspent budget buys another round, and that round goes after the kinds
+// this city still has nothing for rather than asking all four again.
+const secondRound = angleCalls.slice(SOURCE_ANGLES.length)
+assert.ok(secondRound.length > 0, 'the leftover budget buys a second round')
+assert.ok(secondRound.length < SOURCE_ANGLES.length, 'and it is narrower than the first')
+assert.equal(new Set(secondRound).size, secondRound.length, 'no angle is asked twice in one round')
 assert.equal(run.costUsd, +(run.calls.length * 0.02).toFixed(5), 'cost is the measured balance delta over every call')
 assert.equal(run.stoppedBecause, 'window covered')
 assert.equal(run.sources.length, 2)
@@ -328,6 +334,31 @@ const asked = run.calls.filter(c => c.label.startsWith('catalogues:')).map(c => 
 assert.deepEqual(asked.slice(0, 2).sort(), ['cinema', 'tickets'],
   'the first round searches only for the kinds the city has nothing for')
 assert.ok(run.calls.some(c => c.label === 'kino.test/heute'), 'and the film programme it found is read')
+
+// A film page that renders its showtimes in the browser reads as an empty page
+// here. Publishing it as the city's cinema catalogue would mark the gap filled
+// for every later run, so an empty page is reported as barren and the run goes
+// back out for another one while it can still afford to read it.
+const cinemaPages = []
+run = await runScout({}, { fetchPage: offline,
+  city: 'Testheim', from: FROM, to: TO, budgetUsd: 2, discover: 'always',
+  sources: [{ url: 'https://one.test/events', name: 'One', kind: 'city' }],
+  api: fakeApi({ answer: (p) => {
+    if (/List the web pages that catalogue/.test(p)) {
+      if (!/cinema|film|showtimes|Kinoprogramm/i.test(p)) return JSON.stringify({ sources: [] })
+      cinemaPages.push(1)
+      return JSON.stringify({ sources: cinemaPages.length === 1
+        ? [{ name: 'Dead', url: 'https://dead.test/kino', kind: 'cinema' }]
+        : [{ name: 'Live', url: 'https://live.test/kino', kind: 'cinema' }] })
+    }
+    return /dead\.test/.test(p) ? harvest([]) : harvest([ev('Film Showing')])
+  } }),
+})
+assert.ok(run.barren.includes('https://dead.test/kino'), 'the page that held nothing is marked barren')
+assert.equal(run.productive.some(s => s.url === 'https://dead.test/kino'), false,
+  'and is not offered to the next visitor as a catalogue')
+assert.ok(cinemaPages.length > 1, 'the cinema gap is searched for again rather than counted as filled')
+assert.ok(run.candidates.some(c => c.title === 'Film Showing'), 'so the city gets its films')
 
 
 // A run that walks out of catalogues with most of the money untouched has not

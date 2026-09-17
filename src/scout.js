@@ -114,10 +114,6 @@ export const SOURCE_ANGLES = [
   },
 ]
 
-// What we already know is a list of pages, not a list of sites. Excluding whole
-// hosts is how a run that already had muenchen.de's front listing went looking
-// for "other" catalogues and stepped over muenchen.de's own today view - the one
-// page in the city with forty-four events on it that day.
 // Which angles the city's registry has nothing for. A registry that grew out of
 // one run answers for the kinds that run happened to ask about, and the gap is
 // invisible in a list of nine catalogues: Munich had a portal, a magazine and a
@@ -135,6 +131,10 @@ export function missingAngles(sources = []) {
   return SOURCE_ANGLES.filter(a => !(ANGLE_COVERED_BY[a.key] || [a.kind]).some(k => have.has(k)))
 }
 
+// What we already know is a list of pages, not a list of sites. Excluding whole
+// hosts is how a run that already had muenchen.de's front listing went looking
+// for "other" catalogues and stepped over muenchen.de's own today view - the one
+// page in the city with forty-four events on it that day.
 export function buildSourceMessages({ city, country, exclude = [], angle = null }) {
   const where = `${city}${country ? ', ' + country : ''}`
   const known = [...new Set(exclude.map(s => pageOf(s.url || s)).filter(Boolean))].slice(0, 24)
@@ -564,6 +564,7 @@ export async function runScout(acc, {
 
   const visited = new Set()
   const productive = new Map()   // pages that actually yielded events, for the registry
+  const barren = new Map()       // ...and pages we read that had nothing on them
   let openWebRan = false
 
   async function runJob(job) {
@@ -638,7 +639,13 @@ export async function runScout(acc, {
     }
 
     progress({ id, phase: 'harvest', label: `${label}: ${inWindow.length} events, ${added} new` })
+    // A page we read and found nothing on is not a catalogue worth passing to
+    // the next visitor. Publishing it anyway is worse than saying nothing: a
+    // film page that renders its showtimes in the browser reads as empty here,
+    // and in the registry it marks the city's cinema gap as filled for good.
+    if (job.url && !inWindow.length) barren.set(job.url, job.source?.kind || 'other')
     if (added > 0 && job.url) {
+      barren.delete(job.url)
       productive.set(job.url, {
         url: job.url,
         name: job.source?.name || hostOf(job.url),
@@ -684,13 +691,31 @@ export async function runScout(acc, {
   // Only when this run was already allowed to go looking: a visitor who left
   // "also look for catalogues we do not know yet" unticked does not get a
   // catalogue search anyway just because there is money left.
+  //
+  // A gap that is still a gap is worth going back for even when the money is
+  // nearly gone: finding the film page and reading nothing off it - which is
+  // what a browser-rendered programme looks like from here - leaves the city
+  // with no cinema at all, and that is not "covered".
+  const stillMissing = () => missingAngles([...usedSources, ...productive.values()]
+    .filter(s => !barren.has(s.url)))
+  // ...but only while there is enough left to search *and* read what it finds.
+  // Spending the last of the budget on a search whose pages can never be opened
+  // buys the visitor nothing at all.
+  const canChaseGaps = () => {
+    const gapsLeft = stillMissing().length
+    return gapsLeft > 0 && budget - spent >= 2 * gapsLeft * estimate()
+  }
   let expansions = 0
   while (wantDiscovery && expansions < MAX_EXPANSIONS && !queue.length &&
-         !shouldStop() && affordable() && spent < budget * EXPAND_BELOW) {
+         !shouldStop() && affordable() && (spent < budget * EXPAND_BELOW || canChaseGaps())) {
     expansions++
-    const tried = [...usedSources, ...productive.values()]
+    const tried = [...usedSources, ...productive.values(), ...barren.keys()]
+    const gapsLeft = stillMissing()
     const more = await discoverSources(tried,
-      `${usd(budget - spent)} of the budget is still unspent - looking for catalogues we have not tried`)
+      gapsLeft.length
+        ? `still nothing for ${gapsLeft.map(a => a.key).join(' or ')} in ${city} - looking again`
+        : `${usd(budget - spent)} of the budget is still unspent - looking for catalogues we have not tried`,
+      gapsLeft.length ? gapsLeft : SOURCE_ANGLES)
     const fresh = more.filter(s => !visited.has(visitKey({ url: s.url, page: 1 })))
     progress({ phase: 'sources', label: fresh.length
       ? `${fresh.length} more ${fresh.length === 1 ? 'catalogue' : 'catalogues'}: ${[...new Set(fresh.map(s => hostOf(s.url)))].join(', ')}`
@@ -727,6 +752,7 @@ export async function runScout(acc, {
     sources: usedSources,
     discovered,
     productive: [...productive.values()],
+    barren: [...barren.keys()],
     stoppedBecause,
     tz: cityZone,
     startedAt,

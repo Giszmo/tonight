@@ -815,8 +815,14 @@ async function publishCandidates(run, picked, msg) {
   // published is the page that actually held events - the dated listing, not the
   // section front page the search engine offers - so nobody pays again to find
   // the way from one to the other.
+  // A page this run read and found nothing on is left out: in the registry it
+  // would answer for its kind forever, so one film page that renders its
+  // showtimes in the browser is enough to keep a city's cinemas invisible.
+  const barren = new Set(run.barren || [])
   const registry = new Map()
-  for (const s of [...(run.discovered || []), ...(run.productive || [])]) if (s?.url) registry.set(s.url, s)
+  for (const s of [...(run.discovered || []), ...(run.productive || [])]) {
+    if (s?.url && !barren.has(s.url)) registry.set(s.url, s)
+  }
   if (registry.size) {
     try {
       await publishSources(state.identity, [...registry.values()].slice(0, 12),
