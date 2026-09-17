@@ -74,3 +74,22 @@ site key receives its manifest updates.
 | `src/mockppq.js` | fake PPQ behind `?mock=1`, so the paid path is testable |
 | `src/main.js` | the page |
 | `DESIGN.md` | the conventions this page relies on and why |
+
+## Still to do
+
+- **Remote signing (NIP-46 / bunker).** Today the page signs with a NIP-07
+  extension if there is one and with a guest key it generates otherwise. Anyone
+  whose key lives in a bunker - which is most people who care about their key -
+  cannot yet publish an event or an RSVP under their own identity.
+- **Cinema.** Film programmes are the largest single category in a city and the
+  hardest to read: the aggregators that matter often render showtimes in the
+  browser, and a page like that is blank to `src/reader.js`. A discovered page
+  that yields nothing is no longer published as the city's cinema catalogue, but
+  the run still needs a way to reach a server-rendered programme reliably.
+- **Reading a listing whole.** `muenchen.de`'s today view lists about 44 events
+  and one pass returns 16 of them; `in-muenchen.de/veranstaltungen` returns none
+  at all through the reader. The big culture catalogues are found now and
+  under-read, and that is the ceiling on everything that is not a film.
+- **A run that publishes without a person in front of it.** Every candidate is
+  reviewed and signed by the visitor who paid for the run, which is the right
+  default and also means a city fills only while somebody is looking at it.
