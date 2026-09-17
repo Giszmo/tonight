@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tonight — what's on near you</title>
+<meta name="description" content="Open local event listings on nostr. Read for free, scout on demand, pay only for what you ask for.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <h1>Tonight</h1>
+  </div>
+  <div class="ident" id="ident" title="your nostr identity on this device"></div>
+</header>
+
+<nav class="picker" aria-label="place and time">
+  <div class="cities" id="cities"></div>
+  <form class="addcity" id="addcity" autocomplete="off">
+    <input id="cityq" type="search" placeholder="add a city…" aria-label="add a city">
+    <div class="suggest" id="suggest" hidden></div>
+  </form>
+  <div class="when" id="when" role="tablist"></div>
+</nav>
+
+<main>
+  <div id="status" class="status"></div>
+  <ul id="list" class="list"></ul>
+  <div id="empty" class="empty" hidden></div>
+</main>
+
+<section class="scoutbar" id="scoutbar">
+  <div class="runinfo" id="runinfo"></div>
+  <button id="scout" class="primary">Scout this city now</button>
+</section>
+
+<footer class="foot">
+  <span>Events, endorsements and scouting records are <a href="https://github.com/nostr-protocol/nips/blob/master/52.md" target="_blank" rel="noopener">NIP-52</a> events on public relays. Anything you publish here is public.</span>
+  <button id="settings-open" class="linkish">settings</button>
+</footer>
+
+<dialog id="sheet">
+  <div class="sheet-body" id="sheet-body"></div>
+  <form method="dialog"><button class="ghost">close</button></form>
+</dialog>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

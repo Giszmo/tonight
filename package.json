@@ -1,0 +1,21 @@
+{
+  "dependencies": {
+    "esbuild": "^0.28.2",
+    "nostr-tools": "^2.25.2",
+    "qrcode-generator": "^2.0.4"
+  },
+  "type": "module",
+  "name": "tonight",
+  "version": "0.1.0",
+  "description": "On-demand, visitor-paid local event scouting on nostr",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test/dedup.test.mjs && node test/scout.test.mjs",
+    "relay": "node test/relay.mjs",
+    "e2e": "node test/e2e.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.63.0",
+    "ws": "^8.21.3"
+  }
+}
