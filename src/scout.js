@@ -22,6 +22,10 @@ export const MAX_PAGES_PER_SOURCE = 4   // pages of one listing we follow
 export const MAX_DRILL = 6              // listing pages we follow off one hub
 export const CONCURRENCY = 3            // catalogues read at the same time
 export const FALLBACK_CALL_COST = 0.02  // used only until a run has measured one
+export const EXTRACT_TOKENS = 16000     // a city-wide cinema listing is 200 showings
+export const SEARCH_TOKENS = 8000
+export const MAX_EXPANSIONS = 2         // extra catalogue searches when the budget outlasts the queue
+export const EXPAND_BELOW = 0.6         // ...and only while this much of it is still unspent
 
 const EVENT_SHAPE = `{"title":"","start":"YYYY-MM-DDTHH:MM","end":"YYYY-MM-DDTHH:MM or null","venue":"","address":"","category":"concert|theatre|opera|cinema|club|exhibition|market|talk|sports|family|other","summary":"one or two sentences in the local language","url":"https://page-for-this-event"}`
 
@@ -39,6 +43,8 @@ const SYSTEM = 'You are an events scout. You search the web and report only real
 // wall clock plus the zone it belongs to. Guessing the zone from the visitor's
 // browser only works while the visitor is in the city they are looking at, and
 // the whole point is to look at cities you are not in yet.
+const usd = (v) => '$' + Math.max(0, v).toFixed(2)
+
 const fmtStamp = (ts) => new Date(ts * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
 
 export function validZone(tz) {
@@ -69,39 +75,82 @@ export function zonedToSeconds(stamp, tz) {
 
 // ---------- stage 1: which catalogues cover this city ----------
 
-export function buildSourceMessages({ city, country, exclude = [] }) {
+// One broad question returns one search's worth of results, and a search for
+// "event listings in München" in English returns an expat blog, one arthouse
+// cinema and a museum archive - not muenchen.de, not in-muenchen.de, not the
+// city-wide film programme. So discovery is several narrow questions instead,
+// each phrased the way a resident would type it, and each one is its own
+// search. Measured on München: the broad form found none of the four pages
+// that actually matter; the angles below found all of them.
+export const SOURCE_ANGLES = [
+  {
+    key: 'today',
+    kind: 'city',
+    ask: "the dated day and week listings a resident uses - the municipality's own events calendar and the local " +
+      "what-is-on magazine or city guide. Search in the local language, the way a resident would type it " +
+      '(for a German city: "Veranstaltungen <city> heute", "was ist heute los in <city>").',
+  },
+  {
+    key: 'cinema',
+    kind: 'cinema',
+    // A city portal's calendar carries concerts and theatre and no films at
+    // all, so cinema has to be asked for on its own or a night out at the
+    // movies is simply missing from the city.
+    ask: "today's film showtimes for this city. Search in the local language " +
+      '(for a German city: "Kinoprogramm <city> heute"). Prefer the page that covers every cinema in the city over ' +
+      "a single cinema's own site.",
+  },
+  {
+    key: 'tickets',
+    kind: 'tickets',
+    ask: 'the ticket platforms and event portals that list dated events here, and give each one\'s listing page for ' +
+      'this city rather than its front page.',
+  },
+  {
+    key: 'venues',
+    kind: 'venue',
+    ask: 'the programme pages of the largest venues - concert halls, theatres, opera, clubs, cultural centres - ' +
+      'and public university or church calendars.',
+  },
+]
+
+export function buildSourceMessages({ city, country, exclude = [], angle = null }) {
   const where = `${city}${country ? ', ' + country : ''}`
   const known = exclude.map(s => hostOf(s.url || s)).filter(Boolean)
+  const ask = angle
+    ? `Look for ${angle.ask.replace(/<city>/g, city)}\n`
+    : 'Look for: the local what-is-on magazine or city guide, the municipality\'s own events calendar, ' +
+      'regional ticket platforms, the programme pages of the largest venues, and the daily film showtimes.\n'
   return [
     { role: 'system', content: SYSTEM },
     {
       role: 'user',
       content:
         `List the web pages that catalogue public events in ${where}.\n` +
-        (known.length ? `We already know these and do not want them again: ${known.join(', ')}. Find others.\n` : '') +
-        'Look for: the local what-is-on magazine or city guide, the municipality\'s own events calendar, ' +
-        'regional ticket platforms, the programme pages of the largest venues (concert halls, theatres, clubs), ' +
-        'and university or church calendars if they are public.\n' +
-        // A city portal's calendar carries concerts and theatre and no films at
-        // all, so cinema has to be asked for by name or a night out at the
-        // movies is simply missing from the city.
-        'Cinema is listed separately from everything else: include the page that shows the daily film showtimes ' +
-        'for this city (the local cinema programme, the arthouse cinemas\' own schedules, the multiplex chains).\n' +
+        (known.length ? `We already know these and do not want them again: ${[...new Set(known)].join(', ')}. Find others.\n` : '') +
+        ask +
         'Give the URL of the page that actually shows the list of dated events - a "today", "this week" or ' +
         'calendar view - not the section front page or the site homepage. A page that only links to other ' +
         'listings is worth half as much as the listing itself.\n' +
         'Only pages you have actually seen in the search results; no guessed URLs.\n' +
         'Return JSON:\n' +
-        '{"sources":[{"name":"","url":"https://…","kind":"magazine|city|tickets|venue|university|other","covers":"what it lists, one line"}]}\n' +
-        'Up to 10, most comprehensive first.',
+        '{"sources":[{"name":"","url":"https://…","kind":"magazine|city|tickets|venue|cinema|university|other","covers":"what it lists, one line"}]}\n' +
+        'Up to 8, most comprehensive first.',
     },
   ]
 }
 
-export function parseSources(text) {
+// A city does not have one page per host. muenchen.de has a today listing and a
+// category calendar; a cinema aggregator has one page per cinema. Collapsing to
+// one entry per host is why a Munich run came back with exactly one cinema, so
+// a host may contribute a few pages - just not a whole site.
+export const MAX_SOURCES_PER_HOST = 3
+
+export function parseSources(text, { perHost = MAX_SOURCES_PER_HOST } = {}) {
   const data = parseJson(text)
   const list = Array.isArray(data) ? data : (data.sources || data.catalogues || [])
-  const seen = new Set()
+  const seenUrl = new Set()
+  const perHostCount = new Map()
   return list
     .map(s => ({
       name: String(s?.name || '').trim().slice(0, 80),
@@ -111,9 +160,14 @@ export function parseSources(text) {
     }))
     .filter(s => {
       if (!s.url) return false
+      const key = s.url.replace(/#.*$/, '').replace(/\/$/, '')
+      if (seenUrl.has(key)) return false
       const host = hostOf(s.url)
-      if (!host || seen.has(host)) return false
-      seen.add(host)
+      if (!host) return false
+      const n = perHostCount.get(host) || 0
+      if (n >= perHost) return false
+      seenUrl.add(key)
+      perHostCount.set(host, n + 1)
       return true
     })
 }
@@ -201,13 +255,44 @@ export function parseCandidates(text, opts) {
 
 function parseJson(text) {
   const cleaned = String(text || '').replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/, '').trim()
-  try {
-    return JSON.parse(cleaned)
-  } catch {
-    const m = cleaned.match(/[[{][\s\S]*[\]}]/)
-    if (!m) throw new Error('model did not return JSON')
-    return JSON.parse(m[0])
+  try { return JSON.parse(cleaned) } catch { /* below */ }
+  const m = cleaned.match(/[[{][\s\S]*[\]}]/)
+  if (m) { try { return JSON.parse(m[0]) } catch { /* below */ } }
+  const repaired = repairTruncatedJson(cleaned)
+  if (repaired) return repaired
+  throw new Error('model did not return JSON')
+}
+
+// A model that runs out of output tokens stops in the middle of an event and
+// the answer is then not JSON at all. Throwing it away throws away the call the
+// visitor paid for: three Munich cinema catalogues cost $0.04 between them and
+// returned nothing, each having already listed dozens of showings before it was
+// cut off. So cut back to the last entry that finished and close what is still
+// open - a truncated answer is a short answer, not a wasted one.
+export function repairTruncatedJson(text) {
+  const start = text.search(/[[{]/)
+  if (start < 0) return null
+  const stack = []
+  let inStr = false, esc = false, safe = -1, safeStack = null
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (ch === '\\') esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') { inStr = true; continue }
+    if (ch === '{' || ch === '[') stack.push(ch === '{' ? '}' : ']')
+    else if (ch === '}' || ch === ']') {
+      stack.pop()
+      // An element that closed inside an array is a place we can cut: the array
+      // holds whole events up to here.
+      if (stack[stack.length - 1] === ']') { safe = i; safeStack = stack.slice() }
+    }
   }
+  if (!stack.length || safe < 0) return null   // balanced, or nothing whole to keep
+  try { return JSON.parse(text.slice(start, safe + 1) + safeStack.reverse().join('')) } catch { return null }
 }
 
 function normalizeCandidate(raw, tz = null) {
@@ -367,27 +452,63 @@ export async function runScout(acc, {
   // somebody already paid for this question - and a run only pays for the
   // search again when there is nothing known, or when it is asked to look for
   // catalogues beyond the ones the registry already holds.
+  //
+  // Each angle is its own search, and they run together: one broad question
+  // buys one search's worth of results, which is how a Munich run ended up with
+  // an expat blog and a single arthouse cinema while muenchen.de sat there
+  // unfound.
   const fromRegistry = Array.isArray(sources) ? sources.filter(s => s?.url) : []
   const wantDiscovery = discover === 'always' || (discover !== 'never' && !fromRegistry.length)
   let usedSources = fromRegistry.slice()
-  let discovered = []
-  if (wantDiscovery) {
-    progress({ phase: 'sources', label: fromRegistry.length
-      ? `looking for catalogues beyond the ${fromRegistry.length} we know`
-      : 'looking for the catalogues that cover ' + city })
-    try {
-      const [res] = await withClaim(() => paidCall('catalogues', buildSourceMessages({ city, country, exclude: fromRegistry }), 2000))
-      const knownHosts = new Set(fromRegistry.map(s => hostOf(s.url)))
-      discovered = parseSources(res.text).filter(s => !knownHosts.has(hostOf(s.url))).slice(0, 10)
-      usedSources = [...discovered, ...fromRegistry]
-    } catch (err) {
-      if (err instanceof InsufficientBalance) throw err
-      console.warn('source discovery failed, falling back to what we have', err)
+  const discovered = []
+
+  const urlKey = (u) => String(u || '').replace(/#.*$/, '').replace(/\/$/, '')
+
+  async function discoverSources(exclude, label) {
+    progress({ phase: 'sources', label })
+    const perAngle = await Promise.all(SOURCE_ANGLES.map(async (angle) => {
+      if (!affordable() || shouldStop()) return []
+      try {
+        const [res] = await withClaim(() => paidCall(
+          'catalogues:' + angle.key,
+          buildSourceMessages({ city, country, exclude, angle }),
+          2000,
+        ))
+        // The angle is what we asked for, so it is a better label than the
+        // model's own guess when the model did not commit to one.
+        return parseSources(res.text).map(s => ({ ...s, kind: s.kind && s.kind !== 'other' ? s.kind : angle.kind }))
+      } catch (err) {
+        if (err instanceof InsufficientBalance) return []
+        console.warn('catalogue search failed for ' + angle.key, err)
+        return []
+      }
+    }))
+    const seen = new Set([...exclude, ...usedSources].map(s => urlKey(s.url || s)))
+    const perHost = new Map()
+    const fresh = []
+    for (const s of perAngle.flat()) {
+      const key = urlKey(s.url)
+      if (seen.has(key)) continue
+      const host = hostOf(s.url)
+      const n = perHost.get(host) || 0
+      if (n >= MAX_SOURCES_PER_HOST) continue
+      seen.add(key)
+      perHost.set(host, n + 1)
+      fresh.push(s)
     }
+    return fresh
+  }
+
+  if (wantDiscovery) {
+    const found = await discoverSources(fromRegistry, fromRegistry.length
+      ? `looking for catalogues beyond the ${fromRegistry.length} we know`
+      : 'looking for the catalogues that cover ' + city)
+    discovered.push(...found)
+    usedSources = [...found, ...fromRegistry]
     progress({
       phase: 'sources',
-      label: discovered.length
-        ? `${discovered.length} new ${discovered.length === 1 ? 'catalogue' : 'catalogues'}: ${discovered.map(s => hostOf(s.url)).join(', ')}`
+      label: found.length
+        ? `${found.length} new ${found.length === 1 ? 'catalogue' : 'catalogues'}: ${[...new Set(found.map(s => hostOf(s.url)))].join(', ')}`
         : 'no catalogues we did not already know',
       sources: usedSources.slice(),
     })
@@ -434,7 +555,7 @@ export async function runScout(acc, {
         city, country, from, to, source: job.source, page: job.page, after: job.after,
         pageText, url: job.url || null,
         known: [...knownShapes, ...accepted.map(candidateShape)],
-      }), 8000, { search: !pageText })
+      }), pageText ? EXTRACT_TOKENS : SEARCH_TOKENS, { search: !pageText })
       entry = call
       harvest = parseHarvest(res.text, { tz: cityZone, base: pageText ? job.url : null })
       if (harvest.tz) cityZone = harvest.tz
@@ -513,6 +634,31 @@ export async function runScout(acc, {
   }
 
   await drain(CONCURRENCY)
+
+  // A run that empties its queue with most of the visitor's money untouched has
+  // not covered the city; it has run out of catalogues. That is what "window
+  // covered · $0.04 of $0.25" really meant. So ask again, naming everything
+  // already tried, and walk whatever comes back.
+  // Only when this run was already allowed to go looking: a visitor who left
+  // "also look for catalogues we do not know yet" unticked does not get a
+  // catalogue search anyway just because there is money left.
+  let expansions = 0
+  while (wantDiscovery && expansions < MAX_EXPANSIONS && !queue.length &&
+         !shouldStop() && affordable() && spent < budget * EXPAND_BELOW) {
+    expansions++
+    const tried = [...usedSources, ...productive.values()]
+    const more = await discoverSources(tried,
+      `${usd(budget - spent)} of the budget is still unspent - looking for catalogues we have not tried`)
+    const fresh = more.filter(s => !visited.has(visitKey({ url: s.url, page: 1 })))
+    progress({ phase: 'sources', label: fresh.length
+      ? `${fresh.length} more ${fresh.length === 1 ? 'catalogue' : 'catalogues'}: ${[...new Set(fresh.map(s => hostOf(s.url)))].join(', ')}`
+      : 'nothing left to try beyond the catalogues already read' })
+    if (!fresh.length) break
+    discovered.push(...fresh)
+    usedSources = [...usedSources, ...fresh]
+    queue.push(...fresh.map(s => ({ source: s, url: s.url, page: 1, after: null, depth: 0 })))
+    await drain(CONCURRENCY)
+  }
 
   // The open web is the weakest pass and it runs alone at the end, so it gets
   // the money the catalogues left rather than money they needed.

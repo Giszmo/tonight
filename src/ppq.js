@@ -54,9 +54,17 @@ export async function ensureAccount() {
 
 // An existing PPQ user can paste their credit id; we mint a capped sub-key so
 // the page can never spend more than the cap.
+//
+// Two shapes to watch. /accounts/create answers flat ({credit_id, api_key}),
+// /keys answers wrapped ({status, data:{api_key}}) - reading the top level here
+// yields undefined and the page then fails every later call as unauthorized.
+// And key names are unique per credit id, so a fixed name makes the second
+// adoption a 409.
 export async function adoptCreditId(creditId, { capUsd = 1 } = {}) {
-  const data = await call('/keys', { creditId, body: { name: 'tonight-events-page', usage_limit_usd: capUsd } })
-  const apiKey = data.api_key || data.key || data.apiKey
+  const name = 'tonight-events-page-' + Math.random().toString(36).slice(2, 8)
+  const res = await call('/keys', { creditId, body: { name, usage_limit_usd: capUsd } })
+  const data = res?.data || res
+  const apiKey = data?.api_key || data?.key || data?.apiKey
   if (!apiKey) throw new Error('PPQ /keys returned no api_key')
   return storeAccount({ creditId, apiKey, capUsd, adopted: true, createdAt: Date.now() })
 }

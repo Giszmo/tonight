@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import {
-  parseCandidates, parseHarvest, parseSources, buildHarvestMessages, buildSourceMessages,
+  parseCandidates, parseHarvest, parseSources, buildHarvestMessages, buildSourceMessages, SOURCE_ANGLES,
+  repairTruncatedJson,
   findDuplicate, runScout, makeGeocoder, zonedToSeconds, validZone, shortUrl,
 } from '../src/scout.js'
 import { htmlToText, readPage, PageUnavailable } from '../src/reader.js'
@@ -48,21 +49,60 @@ assert.equal(parseHarvest('{"tz":"Not/AZone","events":[{"title":"X","start":"202
 assert.equal(parseHarvest('{"tz":"Europe/Berlin","events":[{"title":"X","start":"2026-07-15T20:00:00Z"}]}').candidates[0].start,
   Math.floor(Date.parse('2026-07-15T20:00:00Z') / 1000))
 
+// An answer cut off by the output limit is a short answer, not a lost one: the
+// whole events array up to the last complete entry is still good, and that call
+// has already been paid for.
+const truncated = '{"tz":"Europe/Berlin","events":[' +
+  '{"title":"Whole One","start":"2026-07-15T20:00","venue":"Kino"},' +
+  '{"title":"Whole Two","start":"2026-07-15T21:00","venue":"Kino, \\"Saal 2\\""},' +
+  '{"title":"Cut off here","start":"2026-07-15T2'
+const salvaged = parseHarvest(truncated)
+assert.deepEqual(salvaged.candidates.map(c => c.title), ['Whole One', 'Whole Two'],
+  'complete events survive a truncated answer')
+assert.equal(salvaged.tz, 'Europe/Berlin')
+assert.equal(repairTruncatedJson('{"events":[{"a":1}]}'), null, 'a complete answer is not "repaired"')
+assert.equal(repairTruncatedJson('sorry, nothing found'), null)
+assert.equal(repairTruncatedJson('{"events":[{"a":'), null, 'nothing whole to keep')
+assert.throws(() => parseHarvest('sorry, nothing found'), /did not return JSON/)
+
 // ---------- catalogue discovery ----------
 
+// A host may contribute a few pages - a portal's today view and its calendar,
+// or one page per cinema - but not a whole site, and the same page twice is
+// still one page.
 const sources = parseSources(JSON.stringify({
   sources: [
     { name: 'in München', url: 'https://www.in-muenchen.de/veranstaltungen', kind: 'magazine' },
     { name: 'in München (again)', url: 'https://in-muenchen.de/heute', kind: 'magazine' },
     { name: 'no url', kind: 'city' },
     { name: 'München Ticket', url: 'https://www.muenchenticket.de/events', kind: 'tickets' },
+    { name: 'same page, trailing slash', url: 'https://www.in-muenchen.de/veranstaltungen/', kind: 'magazine' },
+    { name: 'a fourth on that host', url: 'https://in-muenchen.de/kino', kind: 'magazine' },
+    { name: 'a fifth on that host', url: 'https://in-muenchen.de/konzerte', kind: 'magazine' },
   ],
 }))
-assert.equal(sources.length, 2, 'one entry per host, entries without a URL dropped')
-assert.deepEqual(sources.map(s => s.kind), ['magazine', 'tickets'])
+assert.deepEqual(sources.map(s => s.url), [
+  'https://www.in-muenchen.de/veranstaltungen',
+  'https://in-muenchen.de/heute',
+  'https://www.muenchenticket.de/events',
+  'https://in-muenchen.de/kino',
+], 'up to three pages per host, no duplicate URL, nothing without one')
+assert.equal(parseSources(JSON.stringify({ sources: [
+  { url: 'https://a.test/1' }, { url: 'https://a.test/2' },
+] }), { perHost: 1 }).length, 1, 'the per-host cap is settable')
+
 assert.match(buildSourceMessages({ city: 'Traunstein', country: 'Germany' })[1].content, /Traunstein, Germany/)
 const expand = buildSourceMessages({ city: 'München', exclude: [{ url: 'https://www.in-muenchen.de/x' }] })[1].content
 assert.match(expand, /already know these.*in-muenchen\.de/s, 'an expansion search asks for catalogues we do not have')
+
+// Discovery is several narrow searches, not one broad one: the broad form finds
+// an expat blog and one arthouse cinema, the cinema angle finds the city's film
+// programme. Each angle has to reach the model as its own question.
+assert.ok(SOURCE_ANGLES.length >= 3, 'several angles')
+const angled = SOURCE_ANGLES.map(a => buildSourceMessages({ city: 'München', angle: a })[1].content)
+assert.equal(new Set(angled).size, SOURCE_ANGLES.length, 'every angle asks a different question')
+assert.match(angled[SOURCE_ANGLES.findIndex(a => a.key === 'cinema')], /Kinoprogramm München heute/,
+  'the cinema angle is phrased in the local language, with the city substituted')
 
 // ---------- prompts ----------
 
@@ -148,8 +188,14 @@ assert.deepEqual(run.candidates.map(c => c.title),
   'every catalogue is walked, the paginated one twice, and the open search closes the gap')
 assert.equal(run.candidates.filter(c => c.title === 'Shared Gala').length, 1,
   'the same event from two catalogues collapses inside one run')
-assert.equal(run.calls.length, 5, 'catalogues + one.test x2 + two.test + open search')
-assert.equal(run.costUsd, 0.1, 'cost is the measured balance delta over every call')
+const harvestCalls = run.calls.filter(c => !c.label.startsWith('catalogues'))
+assert.deepEqual(harvestCalls.map(c => c.label),
+  ['one.test/events', 'two.test/events', 'one.test/events', 'open web'],
+  'one.test is walked twice, two.test once, and the open search runs last')
+assert.deepEqual(run.calls.filter(c => c.label.startsWith('catalogues')).map(c => c.label.split(':')[1]),
+  [...SOURCE_ANGLES.map(a => a.key), ...SOURCE_ANGLES.map(a => a.key)],
+  'each angle is its own search, and the unspent budget buys one more round of them')
+assert.equal(run.costUsd, +(run.calls.length * 0.02).toFixed(5), 'cost is the measured balance delta over every call')
 assert.equal(run.stoppedBecause, 'window covered')
 assert.equal(run.sources.length, 2)
 
@@ -218,7 +264,7 @@ run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1, sources: registry,
   api: fakeApi({ answer: () => harvest([ev('From The Registry')]) }),
 })
-assert.ok(!run.calls.some(c => c.label === 'catalogues'), 'a populated registry skips the search')
+assert.ok(!run.calls.some(c => c.label.startsWith('catalogues')), 'a populated registry skips the search')
 assert.equal(run.discovered.length, 0, 'nothing new to publish')
 
 // ...and an occasional run asks for catalogues beyond the ones nostr has.
@@ -233,6 +279,39 @@ run = await runScout({}, { fetchPage: offline,
 assert.deepEqual(run.discovered.map(s => s.name), ['Three'], 'only genuinely new catalogues are published back')
 assert.deepEqual(run.sources.map(s => s.name), ['Three', 'One'], 'the unexplored one is walked first')
 assert.ok(run.calls.some(c => c.label === 'three.test/events'), 'the new catalogue is actually read in the same run')
+
+
+// A run that walks out of catalogues with most of the money untouched has not
+// covered the city, it has run out of places to look. Munich stopped at
+// "window covered" having spent $0.04 of $0.25, so an idle budget buys another
+// round of catalogue searches - excluding everything already tried.
+let expansionAsks = 0
+run = await runScout({}, { fetchPage: offline,
+  city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+  api: fakeApi({ answer: (p) => {
+    if (/List the web pages that catalogue/.test(p)) {
+      if (!/already know these/.test(p)) return JSON.stringify({ sources: [{ name: 'One', url: 'https://one.test/events' }] })
+      expansionAsks++
+      assert.match(p, /already know these.*one\.test/s, 'the second round names what has been tried')
+      return JSON.stringify({ sources: [{ name: 'Late', url: 'https://late.test/events' }] })
+    }
+    return harvest([ev('Show from ' + (p.match(/https:\/\/(\w+)\.test/) || [])[1])])
+  } }),
+})
+assert.ok(expansionAsks > 0, 'the leftover budget went back out looking for catalogues')
+assert.ok(run.calls.some(c => c.label === 'late.test/events'), 'and the catalogue it found was walked in the same run')
+assert.ok(run.candidates.some(c => c.title === 'Show from late'), 'so its events are in the result')
+assert.deepEqual(run.discovered.map(s => s.name), ['One', 'Late'], 'both rounds are published back to the registry')
+
+// ...but a budget that is already mostly spent is not raided for another search.
+run = await runScout({}, { fetchPage: offline,
+  city: 'Testheim', from: FROM, to: TO, budgetUsd: 0.14,
+  api: fakeApi({ answer: (p) => /List the web pages that catalogue/.test(p)
+    ? JSON.stringify({ sources: [{ name: 'One', url: 'https://one.test/events' }] })
+    : harvest([ev('Only Show')]) }),
+})
+assert.equal(run.calls.filter(c => c.label.startsWith('catalogues')).length, SOURCE_ANGLES.length,
+  'one round of searches only: ' + run.calls.map(c => c.label).join(', '))
 
 
 // ---------- reading the page instead of searching for it ----------
