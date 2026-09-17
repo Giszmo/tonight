@@ -79,6 +79,12 @@ export async function dedupId({ title, venue, start }) {
   return (await sha256Hex(key)).slice(0, 32)
 }
 
+// Publishers often paste the booking link into the description. The card shows
+// the source as a link already, so strip bare URLs out of the running text.
+function cleanSummary(text) {
+  return String(text || '').replace(/https?:\/\/\S+/g, '').replace(/\s{2,}/g, ' ').trim()
+}
+
 export function parseEvent(ev) {
   const start = startSeconds(ev)
   const venue = tagValue(ev, 'location') || ''
@@ -89,7 +95,7 @@ export function parseEvent(ev) {
     d: tagValue(ev, 'd') || '',
     address: eventAddress(ev),
     title: tagValue(ev, 'title') || (ev.content || '').slice(0, 80) || 'Untitled',
-    summary: tagValue(ev, 'summary') || ev.content || '',
+    summary: cleanSummary(tagValue(ev, 'summary') || ev.content || ''),
     image: tagValue(ev, 'image') || '',
     venue,
     start,
