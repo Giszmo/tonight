@@ -75,6 +75,93 @@ console.log('invoice sheet:', invoiceText.replace(/\s+/g, ' ').slice(0, 220))
 assert.match(invoiceText, /lnbc|sat/i, 'a real Lightning invoice came back from PPQ')
 await page.screenshot({ path: SHOTS + '/03-invoice.png' })
 
+// ---- the whole paid path, on fake money (?mock=1, src/mockppq.js) ----
+// Budget, catalogue discovery, a multi-call harvest, dedup against what the
+// city already has, publishing, and the registry the next visitor reads.
+const m = await browser.newPage({ viewport: { width: 430, height: 940 }, deviceScaleFactor: 2, locale: 'de-DE', timezoneId: 'Europe/Berlin' })
+m.on('pageerror', e => console.log('  mock page exception:', e.message))
+m.on('console', e => { if (e.type() === 'error') console.log('  mock page error:', e.text()) })
+await m.addInitScript(([relayUrl]) => localStorage.setItem('tonight.relays', JSON.stringify([relayUrl])), [relay.url])
+await m.goto(site.url + '/?city=munchen&when=week&mock=1', { waitUntil: 'networkidle' })
+await m.waitForSelector('.card')
+const listedBefore = (await m.$$('.card')).length
+
+// empty balance -> top up -> the paid state, which is a state and not a sentence
+await m.click('#scout')
+await m.waitForSelector('#sheet-body')
+await m.click('#sheet-body .ghost:has-text("$1.00")')
+await m.waitForSelector('#payst')
+await m.waitForSelector('.paid', { timeout: 30000 })
+const paidText = (await m.textContent('#sheet-body')).replace(/\s+/g, ' ')
+console.log('paid sheet:', paidText.slice(0, 160))
+assert.match(paidText, /Paid/)
+assert.match(paidText, /\$1\.05/, 'the new balance is shown, including the 5% Lightning bonus')
+assert.ok((await m.$$('.confetti i')).length > 20, 'the payment is celebrated, not announced in small print')
+await m.screenshot({ path: SHOTS + '/05-paid.png' })
+
+// the budget is the visitor's decision, and the sheet says what it buys
+await m.click('#sheet-body .primary')
+await m.waitForSelector('.budgets')
+const scoutSheet = (await m.textContent('#sheet-body')).replace(/\s+/g, ' ')
+console.log('scout sheet:', scoutSheet.slice(0, 200))
+assert.match(scoutSheet, /Spend at most/)
+assert.match(scoutSheet, /events are already listed here/, 'known events are declared as part of the deal')
+await m.screenshot({ path: SHOTS + '/06-budget.png' })
+await m.click('#sheet-body .primary:has-text("Start the run")')
+
+// the run is visible while it happens
+await m.waitForSelector('.runlog li')
+await m.waitForTimeout(1500)
+console.log('run log:', (await m.$$eval('.runlog li', ns => ns.map(n => n.textContent))).join(' | '))
+await m.screenshot({ path: SHOTS + '/07-running.png' })
+
+await m.waitForSelector('.candidates', { timeout: 120000 })
+const candSummary = (await m.textContent('#sheet-body')).replace(/\s+/g, ' ')
+console.log('candidates:', candSummary.slice(0, 220))
+const cands = await m.$$('.cand')
+console.log(`  ${cands.length} candidates`)
+assert.ok(cands.length >= 30, 'a run walks catalogues instead of returning a handful: ' + cands.length)
+assert.match(candSummary, /calls over \d+ catalogues/)
+// The ticket shop in the mock re-lists an event the city already has, under its
+// own wording. It must be found and then dropped, not offered for publishing.
+const ticketRun = /muenchenticket\.de (\d+)\/(\d+)/.exec(candSummary)
+assert.ok(ticketRun && Number(ticketRun[1]) < Number(ticketRun[2]),
+  'the re-listed event is found and then dropped: ' + (ticketRun ? ticketRun[0] : 'no ticket-shop line'))
+assert.equal((await m.$$('.cand.dup')).length, 0, 'nothing already published survives into the review list')
+await m.screenshot({ path: SHOTS + '/08-candidates.png' })
+
+const beforePublish = relay.events.length
+await m.click('#sheet-body .primary:has-text("publish")')
+await m.waitForFunction(() => !document.getElementById('sheet').open, null, { timeout: 180000 })
+await m.waitForTimeout(2500)
+const publishedByRun = relay.events.slice(beforePublish)
+const kinds = publishedByRun.reduce((a, e) => (a[e.kind] = (a[e.kind] || 0) + 1, a), {})
+console.log('published by the run:', JSON.stringify(kinds))
+assert.ok((kinds[31923] || 0) >= 30, 'the whole harvest is published, not a sample')
+assert.equal(kinds[2121], 1, 'one scout-run record')
+assert.ok((kinds[31121] || 0) >= 3, 'the catalogues are published so the next visitor does not pay to find them')
+const anEvent = publishedByRun.find(e => e.kind === 31923)
+assert.equal(anEvent.tags.find(t => t[0] === 'start_tzid')[1], 'Europe/Berlin', 'events carry the city zone')
+assert.ok(anEvent.tags.some(t => t[0] === 'r' && /^https:/.test(t[1])), 'every published event keeps its source URL')
+
+await m.waitForSelector('.card')
+await m.waitForTimeout(1500)
+const listedAfter = (await m.$$('.card')).length
+console.log(`cards before the run: ${listedBefore}, after: ${listedAfter}`)
+assert.ok(listedAfter > listedBefore + 20, 'the city listing actually filled up')
+await m.screenshot({ path: SHOTS + '/09-filled.png', fullPage: true })
+
+// second visitor: the catalogues now come off the relay instead of a paid search
+await m.goto(site.url + '/?city=munchen&when=week&mock=1', { waitUntil: 'networkidle' })
+await m.waitForSelector('.card')
+await m.click('#scout')
+await m.waitForSelector('.budgets', { timeout: 60000 })
+const secondRun = (await m.textContent('#sheet-body')).replace(/\s+/g, ' ')
+console.log('second run sheet:', secondRun.slice(0, 200))
+assert.match(secondRun, /catalogues for München are already on the relays/, 'the registry is read back')
+await m.screenshot({ path: SHOTS + '/10-registry.png' })
+await m.keyboard.press('Escape')
+
 // desktop shot for the record
 const wide = await browser.newPage({ viewport: { width: 1280, height: 900 }, deviceScaleFactor: 2, locale: 'de-DE', timezoneId: 'Europe/Berlin' })
 await wide.addInitScript(([relayUrl]) => localStorage.setItem('tonight.relays', JSON.stringify([relayUrl])), [relay.url])

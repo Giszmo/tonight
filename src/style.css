@@ -140,3 +140,42 @@ dialog h2:first-child { margin-top: 0 }
 .warn { color: var(--warn); font-size: .83rem }
 .qr { background: #fff; padding: .5rem; border-radius: var(--radius); width: min(14rem, 60%); margin: .5rem 0 }
 .qr svg { display: block; width: 100%; height: auto }
+
+/* --- scouting: budget, live run, candidate review --- */
+.budgets { display: flex; gap: .4rem; flex-wrap: wrap; margin: .5rem 0 }
+.bar { height: .35rem; background: var(--line); border-radius: 999px; overflow: hidden; margin: .5rem 0 }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s ease }
+.runlog {
+  list-style: none; margin: .5rem 0; padding: 0; max-height: 40vh; overflow: auto;
+  font-size: .88rem; color: var(--dim);
+}
+.runlog li { padding: .2rem 0 .2rem .9rem; position: relative }
+.runlog li::before { content: '·'; position: absolute; left: .1rem; color: var(--accent) }
+.runlog li[data-pending="1"] { color: var(--ink) }
+.runsrc { font-size: .78rem; word-break: break-word }
+.candidates .daysep { margin: .8rem 0 .3rem }
+.candidates .daysep:first-child { margin-top: 0 }
+
+/* --- paid --- */
+.center { text-align: center }
+.big { font-size: 1.3rem; font-weight: 640; margin: .2rem 0 }
+.paid { display: flex; justify-content: center; margin: .5rem 0 0 }
+.paid .tick {
+  display: grid; place-items: center; width: 3rem; height: 3rem; border-radius: 50%;
+  background: var(--accent); color: var(--accent-ink); font-size: 1.5rem; font-weight: 700;
+  animation: pop .45s cubic-bezier(.2, 1.4, .4, 1) both;
+}
+@keyframes pop { from { transform: scale(.2); opacity: 0 } to { transform: scale(1); opacity: 1 } }
+.confetti { position: absolute; inset: 0; overflow: hidden; pointer-events: none; border-radius: var(--radius) }
+.confetti i {
+  position: absolute; top: -1rem; border-radius: 1px; opacity: 0;
+  animation: fall var(--d) var(--delay) cubic-bezier(.25, .6, .4, 1) forwards;
+}
+@keyframes fall {
+  0% { opacity: 1; transform: translate3d(0, -1rem, 0) rotate(0) }
+  100% { opacity: 0; transform: translate3d(var(--x), 40rem, 0) rotate(var(--r)) }
+}
+@media (prefers-reduced-motion: reduce) {
+  .paid .tick { animation: none }
+}
+.check { display: flex; gap: .5rem; align-items: start; font-size: .9rem; color: var(--dim); cursor: pointer }

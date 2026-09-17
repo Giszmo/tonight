@@ -7,6 +7,7 @@ export const KIND_CALENDAR = 31924
 export const KIND_RSVP = 31925
 export const KIND_REACTION = 7
 export const KIND_SCOUT_RUN = 2121     // provisional, app-specific: see DESIGN.md
+export const KIND_SOURCE = 31121       // provisional, app-specific: a catalogue worth scouting
 
 export const tagValues = (ev, name) => (ev.tags || []).filter(t => t[0] === name).map(t => t[1])
 export const tagValue = (ev, name) => tagValues(ev, name)[0]
@@ -181,14 +182,14 @@ function rankCopies(a, b) {
 
 // Tag set for a newly published event. Multi-precision `g` is what makes it
 // findable by anyone else's "near me" query.
-export function buildEventTags({ d, title, summary, start, end, venue, address, lat, lon, city, category, url, image }) {
+export function buildEventTags({ d, title, summary, start, end, venue, address, lat, lon, city, category, url, image, tzid }) {
   const tags = [
     ['d', d],
     ['title', title],
     ['start', String(start)],
   ]
   if (end) tags.push(['end', String(end)])
-  tags.push(['start_tzid', Intl.DateTimeFormat().resolvedOptions().timeZone])
+  tags.push(['start_tzid', tzid || Intl.DateTimeFormat().resolvedOptions().timeZone])
   if (summary) tags.push(['summary', summary])
   if (image) tags.push(['image', image])
   if (venue) tags.push(['location', address ? `${venue}, ${address}` : venue])
@@ -203,4 +204,42 @@ export function buildEventTags({ d, title, summary, start, end, venue, address, 
   if (url) tags.push(['r', url])
   tags.push(['alt', `${title} - ${venue || city || ''}`])
   return tags
+}
+
+// A scouting source: one catalogue page that lists events for a city. Finding
+// them costs a paid search, so the finder publishes them and the next visitor
+// spends their money on events instead of on the same question.
+export function buildSourceTags({ url, name, kind, covers, city, lat, lon }) {
+  const tags = [
+    ['d', sourceDTag(url)],
+    ['r', url],
+    ['title', name || sourceDTag(url)],
+  ]
+  if (kind) tags.push(['source_kind', kind])
+  if (covers) tags.push(['summary', covers])
+  if (city) tags.push(['t', slugify(city)])
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    for (const g of geohashPrefixes(encodeGeohash(lat, lon, 5), 2, 5)) tags.push(['g', g])
+  }
+  tags.push(['alt', `event catalogue for ${city || 'a city'}: ${url}`])
+  return tags
+}
+
+export function sourceDTag(url) {
+  try {
+    const u = new URL(url)
+    return (u.hostname.replace(/^www\./, '') + u.pathname.replace(/\/$/, '')).slice(0, 100)
+  } catch { return String(url || '').slice(0, 100) }
+}
+
+export function parseSourceEvent(ev) {
+  const url = tagValue(ev, 'r') || ''
+  return {
+    url,
+    name: tagValue(ev, 'title') || sourceDTag(url),
+    kind: tagValue(ev, 'source_kind') || 'other',
+    covers: tagValue(ev, 'summary') || '',
+    pubkey: ev.pubkey,
+    createdAt: ev.created_at,
+  }
 }

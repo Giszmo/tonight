@@ -2,8 +2,8 @@
 // there is no server in this product.
 import { SimplePool, finalizeEvent, generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
 import {
-  KIND_DATE_EVENT, KIND_TIME_EVENT, KIND_RSVP, KIND_REACTION, KIND_SCOUT_RUN,
-  parseEvent, eventAddress,
+  KIND_DATE_EVENT, KIND_TIME_EVENT, KIND_RSVP, KIND_REACTION, KIND_SCOUT_RUN, KIND_SOURCE,
+  parseEvent, eventAddress, buildSourceTags, parseSourceEvent,
 } from './events.js'
 import { geohashPrefixes, encodeGeohash, slugify } from './geo.js'
 
@@ -162,6 +162,48 @@ export async function fetchScoutRuns(city) {
       summary: ev.content,
     }))
     .sort((a, b) => b.at - a.at)
+}
+
+// The catalogue registry for a city. Anyone who paid for the "which sites list
+// events here" question publishes the answer, so the next visitor's money goes
+// into events instead. Several scouts publish overlapping sets; one entry per
+// host wins, the most recently confirmed one.
+export async function fetchSources(city, { lat, lon } = {}) {
+  const tags = [slugify(city), String(city || '').toLowerCase()].filter((v, i, a) => v && a.indexOf(v) === i)
+  const filters = [{ kinds: [KIND_SOURCE], '#t': tags, limit: 200 }]
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    filters.push({ kinds: [KIND_SOURCE], '#g': geohashPrefixes(encodeGeohash(lat, lon, 5), 4, 5), limit: 200 })
+  }
+  const batches = await Promise.all(filters.map(f => query(f)))
+  const byHost = new Map()
+  for (const batch of batches) {
+    for (const ev of batch) {
+      const src = parseSourceEvent(ev)
+      if (!src.url) continue
+      let host
+      try { host = new URL(src.url).hostname.replace(/^www\./, '') } catch { continue }
+      const prev = byHost.get(host)
+      if (!prev || prev.createdAt < src.createdAt) byHost.set(host, src)
+    }
+  }
+  return [...byHost.values()].sort((a, b) => b.createdAt - a.createdAt)
+}
+
+export async function publishSources(identity, sources, { city, lat, lon }) {
+  let ok = 0
+  for (const s of sources) {
+    if (!s?.url) continue
+    try {
+      await publish(await identity.sign({
+        kind: KIND_SOURCE,
+        created_at: Math.floor(Date.now() / 1000),
+        content: s.covers || '',
+        tags: buildSourceTags({ url: s.url, name: s.name, kind: s.kind, covers: s.covers, city, lat, lon }),
+      }))
+      ok++
+    } catch (err) { console.warn('source publish failed', s.url, err) }
+  }
+  return ok
 }
 
 const num = (ev, name) => parseInt((ev.tags.find(t => t[0] === name) || [])[1] || '0', 10)

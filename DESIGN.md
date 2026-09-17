@@ -39,7 +39,32 @@ order is organiser-claimed (a key whose NIP-05 domain matches the source) >
 human-signed > scout bot; the first tier needs an organiser claim path that does
 not exist yet.
 
-## 3. Scout run records — kind 2121 (provisional)
+## 3. Source catalogues — kind 31121 (provisional)
+
+A city's events are not scattered evenly over the web; they sit in a handful of
+catalogues — the what-is-on magazine, the municipal calendar, the regional
+ticket platform, the programme pages of the big houses. Finding that handful
+costs a paid search, and it is the same answer for everybody, so it belongs on
+the relays rather than in one visitor's session:
+
+```
+kind: 31121 (parameterised replaceable)
+tags: d <host+path>, r <url>, title <name>, source_kind <magazine|city|tickets|venue|…>,
+      summary <one line>, t <city-slug>, g <geohash prefixes>, alt <text>
+```
+
+A run reads the registry first (`fetchSources`) and spends its money on events.
+The discovery call happens when a city has no known catalogues, or when the
+visitor ticks "also look for catalogues we do not know yet" — that call is told
+which hosts we already have and asked for others, and only genuinely new ones
+are published back. The page ticks that box by itself for a city with fewer
+than four known catalogues or a registry older than 30 days.
+
+Several scouts publish overlapping sets; the reader keeps one entry per host,
+the most recently confirmed. A visitor who only wants a venue watched can
+publish one of these without running anything.
+
+## 4. Scout run records — kind 2121 (provisional)
 
 Without a cron, a visitor has to be able to see whether a city is stale and what
 a refresh costs before paying for one. Every run publishes a regular event:
@@ -47,7 +72,8 @@ a refresh costs before paying for one. Every run publishes a regular event:
 ```
 kind: 2121
 tags: t <city-slug>, g <geohash prefixes>, found <n>, published <n>,
-      cost_usd <measured>, model <id>, window <from> <to>, alt <text>
+      cost_usd <measured>, budget_usd <cap the visitor set>, calls <n>,
+      sources <n>, model <id>, window <from> <to>, alt <text>
 content: human-readable one-liner
 ```
 
@@ -59,6 +85,43 @@ and stays honest about the model people actually use.
 Kind 2121 is unassigned in the NIPs kind registry as of 2026-09-17 and is
 app-specific here. If this pattern survives contact with reality it belongs in a
 NIP together with the dedup `d` convention.
+
+`found` is now new candidates rather than everything the model said: an event
+the city already has never becomes a candidate (see below), so `found` divided
+by `cost_usd` is the number the next visitor actually cares about — new events
+per cent — and it is what the budget sheet quotes.
+
+## 5. What one run does
+
+A run is not one search. One search returns the four events that happened to
+rank, which is how the first version behaved.
+
+1. **Catalogues.** From the registry (free), or one paid call that finds them.
+2. **Walk them.** One call per catalogue, asking for *every* event in the
+   window, up to 60 per answer. A catalogue that says `"more": true` and yielded
+   something new gets another pass, told where the last one stopped, up to three
+   passes.
+3. **One open-web pass** at the end, for what no catalogue lists.
+4. **Stop on the visitor's budget**, never on a fixed call count: before each
+   call the run checks whether the most expensive call so far would still fit
+   under the cap, and the cap is itself clamped to the balance. Cost is measured
+   from the PPQ balance around every single call.
+
+Everything the city already has is fed into every prompt as "skip these", and
+everything that comes back is filtered again client-side with the same
+`sameEvent` matcher the listing uses — the prompt saves tokens, the filter is
+what actually holds. Candidates are deduplicated against each other too, so the
+same gala listed by the magazine and the ticket shop is one candidate.
+
+## 6. Times belong to the city, not to the reader
+
+A listing says "20:00". Which 20:00 depends on the city, and the visitor may be
+looking at Munich from Mexico — which is the whole point of a city picker. So
+every window we send is stated in UTC, and the model is asked to answer in the
+city's own wall clock plus the IANA zone it used (`"tz": "Europe/Berlin"`).
+Timestamps come back through `Intl` in that zone, and the published event
+carries it as `start_tzid`. Without a `tz` the browser's zone is the fallback,
+which is right only for a visitor who is already there.
 
 ## Money and keys
 
@@ -76,6 +139,16 @@ NIP together with the dedup `d` convention.
   the nsec so it can be kept — which means events published here carry a
   reputation that can be followed, rather than being anonymous noise.
 
+## Testing the paid path without paying
+
+`?mock=1` swaps the PPQ client for `src/mockppq.js`: fake catalogues, fake
+harvests with pagination, an invoice that pays itself after five seconds, and a
+ticket shop that deliberately re-lists an event the city already has. It exists
+so the parts that only happen after money changes hands — the budget, the run
+log, the candidate review, the dedup, the confetti — are driven end to end by
+`npm run e2e` in a real browser against a throwaway relay. It never touches the
+network and it is not reachable without the query parameter.
+
 ## Known limits
 
 - Coverage is bound by the quality of PPQ's web search (Exa). Ticketed and
@@ -86,3 +159,7 @@ NIP together with the dedup `d` convention.
 - Organiser claims and web-of-trust ranking are specified above but not built;
   the page counts raw endorsements and marks the ones from people you follow.
 - No recurrence support (NIP-52 has none yet).
+- A harvest is bound by what the model will read of a catalogue page. Deep
+  pagination is asked for and often delivered, but a thousand-entry week is not
+  going to arrive in one run; it arrives over several runs by several visitors,
+  which is why nothing is re-collected twice.

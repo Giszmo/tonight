@@ -2,13 +2,18 @@
 // whoever wants fresher data pay for one scouting run, in their own browser.
 import {
   getIdentity, fetchCityEvents, fetchEndorsements, fetchFollows, fetchScoutRuns,
-  publishRsvp, publish, getRelays, setRelays, DEFAULT_RELAYS,
+  fetchSources, publishSources, publishRsvp, publish, getRelays, setRelays, DEFAULT_RELAYS,
 } from './nostr.js'
 import { groupCopies } from './events.js'
 import { haversineKm, geocodeCity, slugify } from './geo.js'
-import * as ppq from './ppq.js'
-import { runScout, candidateToEvent, scoutRunEvent } from './scout.js'
+import * as realPpq from './ppq.js'
+import { mockPpq } from './mockppq.js'
+import { runScout, candidateToEvent, scoutRunEvent, findDuplicate, makeGeocoder } from './scout.js'
 import qrcode from 'qrcode-generator'
+
+// ?mock=1 swaps in a fake PPQ so the whole paid path can be driven without
+// spending money (src/mockppq.js). The real client is the default.
+let ppq = realPpq
 
 const LS = { cities: 'tonight.cities', active: 'tonight.active' }
 const DEFAULT_CITIES = [{ name: 'München', country: 'Germany', lat: 48.1374, lon: 11.5755 }]
@@ -25,6 +30,7 @@ const state = {
   follows: new Set(),
   identity: null,
   runs: [],
+  sources: [],
   balance: null,
   busy: false,
 }
@@ -128,6 +134,9 @@ function syncUrl() {
   const p = new URLSearchParams()
   p.set('city', state.usingNear ? 'near' : slugify(currentPlace().name))
   p.set('when', state.when)
+  // keep the mock switch in the URL: dropping it would silently put a session
+  // that is clicking around on fake money back on the real, paying API
+  if (ppq.mock) p.set('mock', '1')
   history.replaceState(null, '', '?' + p.toString())
 }
 
@@ -160,11 +169,13 @@ async function load() {
   setStatus(`Reading relays for ${place.name}…`)
   state.groups = []
   render()
-  const [events, runs] = await Promise.all([
+  const [events, runs, sources] = await Promise.all([
     fetchCityEvents({ lat: place.lat, lon: place.lon, city: place.name, from: win.from, to: win.to }),
     fetchScoutRuns(place.name),
+    fetchSources(place.name, { lat: place.lat, lon: place.lon }),
   ])
   state.runs = runs
+  state.sources = sources
   const near = events.filter(e => {
     if (!e.coords) return matchesCityText(e, place)
     const km = haversineKm({ lat: place.lat, lon: place.lon }, e.coords)
@@ -263,17 +274,25 @@ function renderRunInfo() {
   } else {
     bits.push(`${place.name} has never been scouted from this page.`)
   }
+  const rate = eventsPerDollar()
   bits.push(cost !== null
-    ? `A fresh run has cost ${usd(cost)} recently.`
-    : 'A fresh run costs about $0.02-0.03 of inference.')
-  if (state.balance !== null) bits.push(`Your PPQ balance: ${usd(state.balance)}.`)
+    ? `Recent runs here cost ${usd(cost)}${rate ? ` and found about ${Math.round(rate / 10)} events per 10 cents` : ''}.`
+    : 'A run costs what you let it: it walks the city catalogues until your budget is gone.')
+  if (state.sources.length) bits.push(`${state.sources.length} catalogues known.`)
+  if (state.balance !== null) bits.push(`Balance ${usd(state.balance)}.`)
   box.textContent = bits.join(' ')
 }
 
 // PPQ quotes the amount due in BTC; wallets and humans think in sats.
 const satsFromBtc = (btc) => Number.isFinite(Number(btc)) ? Math.round(Number(btc) * 1e8).toLocaleString() : '?'
 
-const usd = (v) => '$' + Number(v || 0).toFixed(!v || Math.abs(v) >= 0.1 ? 2 : 3)
+// Costs here run from a fraction of a cent to a few dollars, so two decimals
+// lose the interesting part and three add a dead zero to $0.05.
+const usd = (v) => {
+  const n = Number(v || 0)
+  if (!n || Math.abs(n) >= 0.1) return '$' + n.toFixed(2)
+  return '$' + n.toFixed(3).replace(/0$/, '')
+}
 
 function render() {
   renderCities()
@@ -328,7 +347,7 @@ function renderCard(group) {
       el('p', { class: 'actions' },
         going,
         counts.length ? el('span', { class: 'counts', text: counts.join(' · ') }) : null,
-        ...group.copies.flatMap(c => c.refs.slice(0, 1)).slice(0, 2).map(url =>
+        ...group.copies.flatMap(c => c.refs.slice(0, 1)).map(safeUrl).filter(Boolean).slice(0, 2).map(url =>
           el('a', { class: 'src', href: url, target: '_blank', rel: 'noopener', text: sourceLabel(url) })),
       ),
     ),
@@ -350,6 +369,15 @@ function displayTags(e, place) {
 
 function sourceLabel(url) {
   try { return 'source: ' + new URL(url).hostname.replace(/^www\./, '') } catch { return 'source' }
+}
+
+// Source links come off public relays, so anyone can put anything in an `r`
+// tag. Only http(s) is ever turned into a link.
+function safeUrl(url) {
+  try {
+    const u = new URL(url)
+    return (u.protocol === 'https:' || u.protocol === 'http:') ? u.href : null
+  } catch { return null }
 }
 
 async function onGoing(group, button) {
@@ -448,20 +476,132 @@ function openSettingsSheet() {
 
 // ---------- scouting ----------
 
+const BUDGETS = [0.05, 0.25, 1]
+
+// What a city costs is not a guess: past runs recorded what they were charged
+// and how many events came back, so the offer is "this much money buys about
+// this many events" in the units the visitor is about to spend.
+function eventsPerDollar() {
+  const rates = state.runs
+    .filter(r => r.costUsd > 0 && r.found > 0)
+    .slice(0, 8)
+    .map(r => r.found / r.costUsd)
+  return median(rates)
+}
+
 async function onScout() {
   if (state.busy) return
+  const btn = $('scout')
+  btn.disabled = true
+  try {
+    const acc = await ppq.ensureAccount()
+    try { state.balance = await ppq.getBalance(acc) } catch { /* shown as unknown below */ }
+    renderRunInfo()
+    if (!(state.balance > 0)) { await openTopupSheet(acc); return }
+    openScoutSheet(acc)
+  } catch (err) {
+    setStatus('PPQ is not reachable: ' + err.message)
+    console.error(err)
+  } finally {
+    btn.disabled = false
+  }
+}
+
+// Before spending, the visitor picks how much. The run walks catalogues until
+// that budget is gone, so the number on this button is the only thing standing
+// between "4 events" and "the whole week".
+function openScoutSheet(acc) {
+  const place = currentPlace()
+  const win = timeWindow(state.when)
+  const rate = eventsPerDollar()
+  const options = [...BUDGETS.filter(v => v <= state.balance + 1e-9), state.balance]
+    .filter((v, i, a) => v > 0 && a.indexOf(v) === i)
+    .sort((a, b) => a - b)
+  let budget = options.includes(0.25) ? 0.25 : options[options.length - 1]
+
+  // The catalogue registry is the cheap path; paying to look for more of them
+  // is worth it when the city is new to us or the list has gone quiet.
+  const newest = state.sources.length ? Math.max(...state.sources.map(s => s.createdAt || 0)) : 0
+  const staleDays = newest ? (Date.now() / 1000 - newest) / 86400 : Infinity
+  const expandBox = el('input', { type: 'checkbox', checked: state.sources.length < 4 || staleDays > 30 })
+
+  const yieldLine = el('p', { class: 'dim' })
+  const chips = el('p', { class: 'budgets' })
+  const renderBudgets = () => {
+    chips.replaceChildren(...options.map(v => el('button', {
+      class: 'chip' + (v === budget ? ' on' : ''),
+      text: v === state.balance ? `all of it · ${usd(v)}` : usd(v),
+      onclick: () => { budget = v; renderBudgets() },
+    })))
+    yieldLine.textContent = rate
+      ? `About ${Math.round(rate * budget)} events at recent prices for ${place.name}.`
+      : 'Nobody has scouted this city from here yet, so the yield is unknown. A first run is the measurement.'
+  }
+  renderBudgets()
+
+  openSheet(
+    el('h2', { text: `Scout ${place.name} · ${win.label}` }),
+    el('p', { class: 'dim', text: state.sources.length
+      ? `${state.sources.length} catalogues for ${place.name} are already on the relays (${state.sources.slice(0, 3).map(s => hostLabel(s.url)).join(', ')}${state.sources.length > 3 ? ', …' : ''}). The run walks them page by page.`
+      : `No catalogues known for ${place.name} yet - the city magazine, the town calendar, ticket sites, the big venues. One call finds them and the list is published for everyone.` }),
+    el('p', { class: 'dim', text: `${state.groups.length} events are already listed here. They go into the search as "skip these" and are filtered out again, so you pay for what is missing.` }),
+    el('p', {}, el('label', { class: 'check' },
+      expandBox,
+      el('span', { text: state.sources.length
+        ? 'also look for catalogues we do not know yet (one extra call)'
+        : 'find the catalogues first (one call)' }),
+    )),
+    el('h2', { text: 'Spend at most' }),
+    chips,
+    yieldLine,
+    el('p', {},
+      el('button', { class: 'primary', text: 'Start the run', onclick: () => { $('sheet').close(); doScout(acc, budget, expandBox.checked ? 'always' : 'never') } }),
+      el('button', { class: 'ghost', text: 'top up first', onclick: () => openTopupSheet(acc) }),
+    ),
+    el('p', { class: 'dim', text: `Balance ${usd(state.balance)}. You see every candidate before anything is published, and you sign what you publish.` }),
+  )
+}
+
+const hostLabel = (url) => { try { return new URL(url).hostname.replace(/^www\./, '') } catch { return url } }
+
+async function doScout(acc, budgetUsd, discover = 'auto') {
   state.busy = true
   const place = currentPlace()
   const win = timeWindow(state.when)
   const btn = $('scout')
   btn.disabled = true
   btn.textContent = 'Scouting…'
+
+  let stop = false
+  const lines = el('ol', { class: 'runlog' })
+  const head = el('p', { class: 'dim', text: 'starting…' })
+  const fill = el('i')
+  const bar = el('div', { class: 'bar' }, fill)
+  const stopBtn = el('button', {
+    class: 'ghost',
+    text: 'stop after this call',
+    onclick: (ev) => { stop = true; ev.target.disabled = true; ev.target.textContent = 'stopping…' },
+  })
+  openSheet(
+    el('h2', { text: `Scouting ${place.name} · ${win.label}` }),
+    head, bar, lines,
+    el('p', {}, stopBtn),
+  )
+
+  const onProgress = ({ phase, label, spent, budget, found }) => {
+    head.textContent = `${usd(spent)} of ${usd(budget)} spent · ${found} new events so far`
+    fill.style.width = Math.min(100, (spent / (budget || 1)) * 100).toFixed(1) + '%'
+    if (label && phase !== 'done') {
+      const last = lines.lastElementChild
+      if (last && last.dataset.pending === '1') last.remove()
+      const li = el('li', { text: label })
+      if (/^reading /.test(label) || /^looking for/.test(label)) li.dataset.pending = '1'
+      lines.append(li)
+      lines.scrollTop = lines.scrollHeight
+    }
+  }
+
   try {
-    const acc = await ppq.ensureAccount()
-    state.balance = await ppq.getBalance(acc)
-    renderRunInfo()
-    if (!(state.balance > 0)) { await openTopupSheet(acc); return }
-    setStatus(`Searching the web for ${place.name} ${win.label}…`)
     const run = await runScout(acc, {
       city: place.name,
       country: place.country,
@@ -469,15 +609,21 @@ async function onScout() {
       lon: place.lon,
       from: win.from,
       to: win.to,
-      known: state.groups.map(g => g.canonical),
+      known: state.groups.flatMap(g => g.copies),
+      sources: state.sources.length ? state.sources : null,
+      discover,
+      budgetUsd,
+      api: ppq,
+      onProgress,
+      shouldStop: () => stop,
     })
     state.balance = run.balance
-    setStatus('')
     openCandidateSheet(run)
   } catch (err) {
     if (err instanceof ppq.InsufficientBalance) {
       await openTopupSheet(ppq.storedAccount())
     } else {
+      $('sheet').close()
       setStatus('Scouting failed: ' + err.message)
       console.error(err)
     }
@@ -490,52 +636,98 @@ async function onScout() {
 }
 
 function openCandidateSheet(run) {
-  const boxes = []
+  const known = state.groups.flatMap(g => g.copies)
+  const rows = []
   const list = el('div', { class: 'candidates' })
-  const known = state.groups.map(g => g.canonical)
+  let dupCount = 0
+  let lastDay = ''
   for (const c of run.candidates) {
-    const dup = known.some(k => Math.abs((k.start || 0) - c.start) < 1800 && k.title.toLowerCase().includes(c.title.toLowerCase().slice(0, 12)))
+    // The model was told what we have; this is the check that actually holds,
+    // and it is the same matcher the listing uses to collapse copies.
+    const dup = findDuplicate(c, known)
+    if (dup) dupCount++
+    const day = fmtDay(c.start)
+    if (day !== lastDay) { list.append(el('div', { class: 'daysep', text: day })); lastDay = day }
     const cb = el('input', { type: 'checkbox', checked: !dup && !!c.url })
-    boxes.push([cb, c])
+    rows.push({ cb, c, dup: !!dup })
     list.append(el('label', { class: 'cand' + (dup ? ' dup' : '') },
       cb,
       el('span', {},
         el('strong', { text: c.title }),
-        el('span', { class: 'meta', text: ` ${fmtDay(c.start)} ${fmtTime(c.start)} · ${c.venue || 'venue unknown'}${dup ? ' · already listed' : ''}` }),
+        el('span', { class: 'meta', text: `${fmtTime(c.start)} · ${c.venue || 'venue unknown'}${c.source ? ' · via ' + c.source : ''}${dup ? ' · already listed' : ''}` }),
         c.url ? el('a', { class: 'src', href: c.url, target: '_blank', rel: 'noopener', text: sourceLabel(c.url) })
               : el('span', { class: 'warn', text: 'no source URL - will not be published' }),
       ),
     ))
   }
+
   const msg = el('p', { class: 'dim' })
+  const setAll = (on) => { for (const r of rows) if (r.c.url && !(on && r.dup)) r.cb.checked = on }
+  const publishable = rows.filter(r => r.c.url && !r.dup).length
+
   openSheet(
-    el('h2', { text: `${run.candidates.length} candidates for ${run.city}` }),
-    el('p', { class: 'dim', text: `Cost of this run: ${usd(run.costUsd)} · model ${run.model}. Check what is real; you sign what you publish.` }),
+    el('h2', { text: run.candidates.length
+      ? `${run.candidates.length} candidates for ${run.city}`
+      : `Nothing new found for ${run.city}` }),
+    el('p', { class: 'dim', text:
+      `${run.calls.length} calls over ${run.sources.length} ${run.sources.length === 1 ? 'catalogue' : 'catalogues'} · ` +
+      `${usd(run.costUsd)} of ${usd(run.budgetUsd)} · stopped: ${run.stoppedBecause}` +
+      (dupCount ? ` · ${dupCount} already listed, unticked` : '') }),
+    el('p', { class: 'runsrc dim', text: 'new/found per catalogue: ' + run.calls.filter(c => c.found !== undefined)
+      .map(c => `${c.label} ${c.added}/${c.found}`).join(' · ') }),
+    run.candidates.length ? el('p', {},
+      el('button', { class: 'ghost', text: `tick all (${publishable})`, onclick: () => setAll(true) }),
+      el('button', { class: 'ghost', text: 'untick all', onclick: () => setAll(false) }),
+    ) : null,
     list,
     el('p', {}, el('button', {
-      class: 'primary', text: 'publish the ticked ones',
+      class: 'primary',
+      text: run.candidates.length ? 'publish the ticked ones' : 'close',
       onclick: async (ev) => {
+        if (!run.candidates.length) { $('sheet').close(); return }
         ev.target.disabled = true
-        const picked = boxes.filter(([cb, c]) => cb.checked && c.url).map(([, c]) => c)
-        let ok = 0
-        for (const c of picked) {
-          try {
-            const signed = await candidateToEvent(state.identity, c, { city: run.city, lat: run.lat, lon: run.lon })
-            await publish(signed)
-            ok++
-            msg.textContent = `published ${ok}/${picked.length}…`
-          } catch (err) { console.error('publish failed', c.title, err) }
-        }
-        try {
-          await publish(await scoutRunEvent(state.identity, run, ok))
-        } catch (err) { console.error('scout run record failed', err) }
-        msg.textContent = `Published ${ok} of ${picked.length}. Everyone reading this city now sees them.`
-        $('sheet').close()
-        await load()
+        await publishCandidates(run, rows.filter(r => r.cb.checked && r.c.url).map(r => r.c), msg)
       },
     })),
     msg,
   )
+}
+
+// Publishing a whole catalogue is a different scale from publishing four
+// events: geocoding is memoised per venue and capped so a run of 90 events does
+// not fire 90 requests at a free public geocoder, and relay writes run a few at
+// a time instead of one after another.
+async function publishCandidates(run, picked, msg) {
+  const geocode = makeGeocoder({ enabled: !ppq.mock })
+  let ok = 0, failed = 0
+  msg.textContent = `publishing 0/${picked.length}…`
+  await inPool(picked, 4, async (c) => {
+    try {
+      const signed = await candidateToEvent(state.identity, c, { city: run.city, lat: run.lat, lon: run.lon, tz: run.tz, geocode })
+      await publish(signed)
+      ok++
+    } catch (err) { failed++; console.error('publish failed', c.title, err) }
+    msg.textContent = `publishing ${ok + failed}/${picked.length}…`
+  })
+
+  // The catalogues this run discovered are worth more than the events: they
+  // turn the next visitor's first call into a harvest instead of a search.
+  if (run.discovered?.length) {
+    try { await publishSources(state.identity, run.discovered, { city: run.city, lat: run.lat, lon: run.lon }) }
+    catch (err) { console.warn('source registry publish failed', err) }
+  }
+  try { await publish(await scoutRunEvent(state.identity, run, ok)) }
+  catch (err) { console.error('scout run record failed', err) }
+
+  msg.textContent = `Published ${ok}${failed ? `, ${failed} failed` : ''}. Everyone reading ${run.city} now sees them.`
+  $('sheet').close()
+  await load()
+}
+
+async function inPool(items, width, fn) {
+  let i = 0
+  const worker = async () => { while (i < items.length) await fn(items[i++]) }
+  await Promise.all(Array.from({ length: Math.min(width, items.length) }, worker))
 }
 
 async function openTopupSheet(acc) {
@@ -584,8 +776,7 @@ async function openTopupSheet(acc) {
             clearInterval(poll)
             state.balance = await ppq.getBalance(acc)
             renderRunInfo()
-            const node = document.getElementById('payst')
-            if (node) node.textContent = `paid - balance ${usd(state.balance)}. Close this and hit scout.`
+            showPaid(acc)
           }
         } catch (err) { /* keep polling until the invoice expires */ }
       }, 4000)
@@ -593,6 +784,54 @@ async function openTopupSheet(acc) {
       box.replaceChildren(el('p', { class: 'warn', text: 'PPQ refused the top-up: ' + err.message }))
     }
   }
+}
+
+// Paying is the one moment in this page where someone parted with money on
+// trust. It gets an answer you cannot miss, and a button that spends it.
+function showPaid(acc) {
+  const place = currentPlace()
+  const rate = eventsPerDollar()
+  openSheet(
+    el('p', { class: 'paid' }, el('span', { class: 'tick', text: '✓' })),
+    el('h2', { class: 'center', text: 'Paid' }),
+    el('p', { class: 'center big', text: usd(state.balance) + ' on your PPQ credit' }),
+    el('p', { class: 'center dim', text: rate
+      ? `Enough for roughly ${Math.round(rate * state.balance)} events at what ${place.name} has cost so far.`
+      : 'Enough for several catalogue passes.' }),
+    el('p', { class: 'center' },
+      el('button', {
+        class: 'primary',
+        text: `Scout ${place.name} now`,
+        onclick: () => { $('sheet').close(); onScout() },
+      }),
+    ),
+    acc?.creditId ? el('p', { class: 'center dim' },
+      el('span', { text: 'Leftover credit is yours: ' }),
+      el('a', { href: ppq.sessionUrl(acc.creditId), target: '_blank', rel: 'noopener', text: 'continue at ppq.ai' }),
+      el('span', { text: ' with the same credit id.' }),
+    ) : null,
+  )
+  confettiBurst($('sheet'))
+}
+
+function confettiBurst(host) {
+  if (!host || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
+  const colours = ['#ffb545', '#ff6b6b', '#5ad1a0', '#63a9ff', '#f4efe8', '#c792ea']
+  const wrap = el('div', { class: 'confetti', 'aria-hidden': 'true' })
+  for (let i = 0; i < 80; i++) {
+    const p = document.createElement('i')
+    p.style.left = (Math.random() * 100).toFixed(1) + '%'
+    p.style.background = colours[i % colours.length]
+    p.style.setProperty('--x', (Math.random() * 60 - 30).toFixed(1) + 'vw')
+    p.style.setProperty('--r', Math.round(Math.random() * 1080 - 540) + 'deg')
+    p.style.setProperty('--d', (1.1 + Math.random() * 1.1).toFixed(2) + 's')
+    p.style.setProperty('--delay', (Math.random() * 0.45).toFixed(2) + 's')
+    p.style.width = (4 + Math.random() * 5).toFixed(1) + 'px'
+    p.style.height = (7 + Math.random() * 7).toFixed(1) + 'px'
+    wrap.append(p)
+  }
+  host.append(wrap)
+  setTimeout(() => wrap.remove(), 3500)
 }
 
 // Lightning invoices are meant to be scanned: the phone in your hand is rarely
@@ -642,6 +881,7 @@ function wireCitySearch() {
 // ---------- boot ----------
 
 async function main() {
+  if (new URLSearchParams(location.search).has('mock')) ppq = mockPpq()
   loadCities()
   state.identity = await getIdentity()
   const acc = ppq.storedAccount()
