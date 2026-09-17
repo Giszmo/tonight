@@ -3,7 +3,7 @@ import {
   parseCandidates, parseHarvest, parseSources, buildHarvestMessages, buildSourceMessages, SOURCE_ANGLES,
   repairTruncatedJson,
   findDuplicate, runScout, makeGeocoder, zonedToSeconds, validZone, shortUrl,
-  missingAngles, pageOf,
+  missingAngles, pageOf, dayZoneForLongitude,
 } from '../src/scout.js'
 import { htmlToText, readPage, PageUnavailable, SLICE_CHARS } from '../src/reader.js'
 import { InsufficientBalance, keyName, KEY_NAME_MAX, getBalance } from '../src/ppq.js'
@@ -411,6 +411,24 @@ assert.doesNotMatch(page[0].content, /search the web/i, 'extraction must not inv
 assert.match(page[1].content, /Do not search, do not recall/)
 assert.match(page[1].content, /--- page text of https:\/\/muenchen\.test\/veranstaltungen\/heute ---/)
 assert.match(page[1].content, /listing_urls/, 'a hub can answer with the listings it points at')
+
+// A daily programme prints a time and no date, so the prompt has to say which
+// day "today" is - and it has to be the city's day, not Greenwich's. An evening
+// in Los Angeles is already tomorrow in UTC, and the run does not know the real
+// zone until the first answer comes back, so the day falls back to longitude.
+assert.equal(dayZoneForLongitude(11.58), 'Etc/GMT-1')      // München, UTC+1/+2
+assert.equal(dayZoneForLongitude(-118.24), 'Etc/GMT+8')    // Los Angeles
+assert.equal(dayZoneForLongitude(0), 'UTC')
+assert.equal(dayZoneForLongitude(undefined), null)
+
+// 2026-09-21T02:00Z is still the evening of the 20th in Los Angeles.
+const laEvening = Math.floor(Date.parse('2026-09-21T02:00:00Z') / 1000)
+const la = buildHarvestMessages({
+  city: 'Los Angeles', from: laEvening, to: laEvening + 21600,
+  url: 'https://la.test/showtimes', pageText: '* Vaterland 18:45',
+  tz: dayZoneForLongitude(-118.24),
+})
+assert.match(la[1].content, /Today is Sunday 2026-09-20 in Los Angeles/)
 
 // Links the model reports are resolved against the page and kept only if they
 // stay on it: a hub's "listings" routinely include a ticket shop's banner.

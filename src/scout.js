@@ -57,6 +57,22 @@ const fmtCityDay = (ts, zone) => {
   } catch { return new Date(ts * 1000).toISOString().slice(0, 10) }
 }
 
+// Until the first answer comes back we do not know the city's zone, and the
+// line that dates a cinema programme - "Today is <day> in <city>" - has to be
+// right on the very first call. Falling back to UTC is fine two hours from
+// Greenwich and wrong in Los Angeles, where an evening run would tell the model
+// that today is tomorrow and date every undated showing a day out. The city's
+// longitude puts the day within an hour everywhere, which is all a calendar day
+// needs. Only for naming the day: parsing wall-clock times still waits for the
+// real IANA zone, because a fixed offset gets DST wrong.
+export function dayZoneForLongitude(lon) {
+  const n = Number(lon)
+  if (!Number.isFinite(n)) return null
+  const hours = Math.max(-12, Math.min(14, Math.round(n / 15)))
+  // Etc/GMT has the sign the other way round: UTC+2 is "Etc/GMT-2".
+  return hours === 0 ? 'UTC' : `Etc/GMT${hours > 0 ? '-' : '+'}${Math.abs(hours)}`
+}
+
 export function validZone(tz) {
   if (!tz || typeof tz !== 'string') return null
   try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return tz } catch { return null }
@@ -646,7 +662,7 @@ export async function runScout(acc, {
     try {
       const [res, call] = await paidCall(label, buildHarvestMessages({
         city, country, from, to, source: job.source, page: job.page, after: job.after,
-        pageText, url: job.url || null, offset, tz: cityZone,
+        pageText, url: job.url || null, offset, tz: cityZone || dayZoneForLongitude(lon),
         known: [...knownShapes, ...accepted.map(candidateShape)],
       }), pageText ? EXTRACT_TOKENS : SEARCH_TOKENS, { search: !pageText })
       entry = call
