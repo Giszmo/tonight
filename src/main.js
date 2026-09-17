@@ -51,6 +51,14 @@ const el = (tag, attrs = {}, ...kids) => {
   return n
 }
 
+
+// A catalogue whose URL names one calendar day is only a catalogue on that day.
+// Any of the shapes a listing writes a date in: 2026-09-17, 17-09-2026,
+// 17.09.2026, 20260917.
+export function isDatedUrl(url) {
+  return /(^|[^\d])(\d{4}[-./]\d{2}[-./]\d{2}|\d{2}[-./]\d{2}[-./]\d{4}|20\d{6})([^\d]|$)/.test(String(url || ''))
+}
+
 // ---------- time windows ----------
 
 export function timeWindow(kind, now = new Date()) {
@@ -828,10 +836,15 @@ async function publishCandidates(run, picked, msg) {
   // A page this run read and found nothing on is left out: in the registry it
   // would answer for its kind forever, so one film page that renders its
   // showtimes in the browser is enough to keep a city's cinemas invisible.
+  // ...and so is a URL with one particular day written into it. A run found
+  // kino-zeit.de/kinoprogramm/ort/München/tag/17-09-2026, which was a fine
+  // catalogue for that evening and a dead one every evening after. The
+  // registry outlives the run that wrote it, so only pages that stay true go
+  // into it.
   const barren = new Set(run.barren || [])
   const registry = new Map()
   for (const s of [...(run.discovered || []), ...(run.productive || [])]) {
-    if (s?.url && !barren.has(s.url)) registry.set(s.url, s)
+    if (s?.url && !barren.has(s.url) && !isDatedUrl(s.url)) registry.set(s.url, s)
   }
   if (registry.size) {
     try {

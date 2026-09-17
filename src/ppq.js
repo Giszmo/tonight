@@ -72,13 +72,33 @@ export async function adoptCreditId(creditId, { capUsd = 1 } = {}) {
   const data = res?.data || res
   const apiKey = data?.api_key || data?.key || data?.apiKey
   if (!apiKey) throw new Error('PPQ /keys returned no api_key')
-  return storeAccount({ creditId, apiKey, capUsd, adopted: true, createdAt: Date.now() })
+  return storeAccount({ creditId, apiKey, keyName: name, capUsd, adopted: true, createdAt: Date.now() })
+}
+
+// What the sub-key has left of its own cap. This is a second, lower ceiling
+// than the credit balance, and it is the one that actually stops a run: a key
+// capped at $1 refuses every call once it has spent $1 while /credits/balance
+// still reports the whole credit. The run then sees money it cannot spend,
+// keeps starting calls, and reports "budget spent" for what is really "this
+// key is used up".
+export async function getKeyAllowance(acc = storedAccount()) {
+  if (!acc?.creditId || !acc?.keyName) return Infinity
+  let list
+  try { list = await call('/keys', { method: 'GET', creditId: acc.creditId }) }
+  catch { return Infinity }          // not our key to inspect; the balance stands
+  const keys = Array.isArray(list?.data) ? list.data : Array.isArray(list) ? list : []
+  const mine = keys.find(k => k?.name === acc.keyName)
+  if (!mine || !(Number(mine.usage_limit_usd) > 0)) return Infinity
+  return Math.max(0, Number(mine.usage_limit_usd) - Number(mine.current_period_usage_usd || 0))
 }
 
 export async function getBalance(acc = storedAccount()) {
   if (!acc) return 0
-  const data = await call('/credits/balance', { apiKey: acc.apiKey })
-  return Number(data.balance || 0)
+  const [data, allowance] = await Promise.all([
+    call('/credits/balance', { apiKey: acc.apiKey }),
+    getKeyAllowance(acc),
+  ])
+  return Math.min(Number(data.balance || 0), allowance)
 }
 
 export async function createLightningTopup(acc, usd) {

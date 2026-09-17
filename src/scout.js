@@ -15,10 +15,11 @@
 import { InsufficientBalance } from './ppq.js'
 import { dedupId, buildEventTags, cityTags, sameEvent, KIND_TIME_EVENT, KIND_SCOUT_RUN } from './events.js'
 import { encodeGeohash, geohashPrefixes, slugify, geocodePlace } from './geo.js'
-import { readPage, sameHost, absolute } from './reader.js'
+import { readPage, sameHost, absolute, SLICE_CHARS } from './reader.js'
 
 export const MAX_PER_CALL = 60          // events we ask for in one harvest call
 export const MAX_PAGES_PER_SOURCE = 4   // pages of one listing we follow
+export const MAX_SLICES = 6             // slices of one long page we read (6 x 60k = the fetch cap)
 export const MAX_DRILL = 6              // listing pages we follow off one hub
 export const CONCURRENCY = 3            // catalogues read at the same time
 export const FALLBACK_CALL_COST = 0.02  // used only until a run has measured one
@@ -46,6 +47,15 @@ const SYSTEM = 'You are an events scout. You search the web and report only real
 const usd = (v) => '$' + Math.max(0, v).toFixed(2)
 
 const fmtStamp = (ts) => new Date(ts * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
+
+// The day the visitor is asking about, written the way the city writes it.
+const fmtCityDay = (ts, zone) => {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: zone || 'UTC', weekday: 'long', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date(ts * 1000)).replace(',', '')
+  } catch { return new Date(ts * 1000).toISOString().slice(0, 10) }
+}
 
 export function validZone(tz) {
   if (!tz || typeof tz !== 'string') return null
@@ -205,6 +215,7 @@ export function parseSources(text, { perHost = MAX_SOURCES_PER_HOST } = {}) {
 // search-backed form.
 export function buildHarvestMessages({
   city, country, from, to, source, known = [], page = 1, after = null, pageText = null, url = null,
+  offset = 0, tz = null,
 }) {
   const where = `${city}${country ? ', ' + country : ''}`
   const shape =
@@ -221,10 +232,26 @@ export function buildHarvestMessages({
       `from the page below. It was fetched from ${url} moments ago.\n` +
       'Use only what is in the page. Do not search, do not recall, do not add anything that is not written there. ' +
       'Event URLs must be links that appear in the page.\n' +
+      // A daily programme prints "Vaterland 18:45" and nowhere on the page the
+      // date: it is today's programme, and today is why you are reading it.
+      // Without this the model does the right thing with the wrong effect - it
+      // is told to omit anything whose date it is unsure of, so a whole city's
+      // cinemas came back as zero events.
+      `Today is ${fmtCityDay(from, tz)} in ${city}. An entry that gives a time but no date - a daily cinema ` +
+      'programme or a "today" listing does this - is on today. Only a date printed on the entry itself overrides ' +
+      'that: an article byline, a "last updated" line or any other date elsewhere on the page is not an event date ' +
+      'and is not a reason to drop anything.\n' +
+      // A page fetched without its links has no per-event URLs at all, and the
+      // model would rather report nothing than report an event it cannot link.
+      'If an entry has no link of its own, use the page\'s own URL - never withhold an event for want of a URL.\n' +
       oneEntry +
+      (offset
+        ? 'This text is the continuation of a longer page; it may open in the middle of an entry. ' +
+          'Skip that first partial entry and report everything after it.\n'
+        : '') +
       'If this page is an index or hub that links to listings instead of listing events itself, return no events ' +
-      'and put the URLs of its actual listing pages (a today/this week/calendar view, or per-category calendars) ' +
-      'into "listing_urls".\n' +
+      'and put the URLs of its actual listing pages (a today/this week/calendar view, per-category calendars, or ' +
+      'a complete-programme page such as "all cinemas", "all films" or "full schedule") into "listing_urls".\n' +
       'If the listing is paginated and continues, put the URL of the next page into "next_url".\n' +
       skip + shape +
       `\n\n--- page text of ${url} ---\n${pageText}\n--- end of page ---`
@@ -405,7 +432,10 @@ export function findDuplicate(candidate, list) {
 // cross the budget the visitor set.
 export async function runScout(acc, {
   city, country, lat, lon, from, to,
-  known = [], model, budgetUsd = 0.25, sources = null, discover = 'auto', maxCalls = 30,
+  // The visitor pays by budget, so a call ceiling that bites first is a ceiling
+  // they did not ask for: a Munich run stopped at 30 calls with $0.23 of $0.55
+  // untouched. This is a runaway guard now, not a budget.
+  known = [], model, budgetUsd = 0.25, sources = null, discover = 'auto', maxCalls = 60,
   api, onProgress = () => {}, shouldStop = () => false, fetchPage = readPage,
 }) {
   if (!api) throw new Error('runScout needs a PPQ api')
@@ -424,6 +454,10 @@ export async function runScout(acc, {
   let modelUsed = model || ''
   let cityZone = null
   let stoppedBecause = 'window covered'
+  // A reason a job decided for itself outranks the guess made from the run's
+  // end state: a call refused for want of credit knows why it stopped, and the
+  // leftover queue must not relabel that as "budget spent".
+  let reasonIsFinal = false
 
   const estimate = () => (calls.length ? Math.max(...calls.map(c => c.costUsd), 0.001) : FALLBACK_CALL_COST)
   // Under concurrency the budget has to be reserved before a call, not counted
@@ -565,6 +599,7 @@ export async function runScout(acc, {
   const visited = new Set()
   const productive = new Map()   // pages that actually yielded events, for the registry
   const barren = new Map()       // ...and pages we read that had nothing on them
+  const fetched = new Map()      // url -> the page's whole text, read once and sliced
   let openWebRan = false
 
   async function runJob(job) {
@@ -581,29 +616,46 @@ export async function runScout(acc, {
     // Read the page ourselves. A model with a web search attached never opens
     // the listing; it answers from snippets, which is one or two events for a
     // page that holds forty.
-    let pageText = null
+    // A long listing is read a slice at a time, but fetched only once: slicing
+    // is free and re-fetching is not (r.jina.ai rate-limits, and the page can
+    // change under us mid-run, which would double-count or lose events).
+    const offset = job.offset || 0
+    let pageText = null, pageRest = 0
     if (job.url) {
       progress({ id, phase: 'fetch', label: `fetching ${label}` })
       try {
-        pageText = await fetchPage(job.url)
+        let whole = fetched.get(job.url)
+        if (whole === undefined) {
+          whole = await fetchPage(job.url)
+          fetched.set(job.url, whole)
+        }
+        whole = String(whole || '')
+        pageText = whole.slice(offset, offset + SLICE_CHARS)
+        pageRest = Math.max(0, whole.length - (offset + pageText.length))
+        if (pageRest) pageText += '\n[page continues below this point]'
+        if (!pageText.trim()) pageText = null
       } catch (err) {
         progress({ id, phase: 'fetch', label: `${label} would not load, asking the web instead` })
       }
     }
+    // Only the end of a page ran out; there is nothing left to ask about.
+    if (job.url && offset && !pageText) return
 
     progress({ id, phase: 'harvest', label: `reading ${label}${job.page > 1 ? ` (page ${job.page})` : ''}` })
     let harvest, entry
     try {
       const [res, call] = await paidCall(label, buildHarvestMessages({
         city, country, from, to, source: job.source, page: job.page, after: job.after,
-        pageText, url: job.url || null,
+        pageText, url: job.url || null, offset, tz: cityZone,
         known: [...knownShapes, ...accepted.map(candidateShape)],
       }), pageText ? EXTRACT_TOKENS : SEARCH_TOKENS, { search: !pageText })
       entry = call
       harvest = parseHarvest(res.text, { tz: cityZone, base: pageText ? job.url : null })
       if (harvest.tz) cityZone = harvest.tz
     } catch (err) {
-      if (err instanceof InsufficientBalance) { stoppedBecause = 'out of credit'; throw err }
+      if (err instanceof InsufficientBalance) {
+        stoppedBecause = 'out of credit'; reasonIsFinal = true; throw err
+      }
       console.warn('harvest failed for ' + label, err)
       if (entry) entry.failed = true
       progress({ id, phase: 'harvest', label: `${label}: no usable answer` })
@@ -643,15 +695,34 @@ export async function runScout(acc, {
     // the next visitor. Publishing it anyway is worse than saying nothing: a
     // film page that renders its showtimes in the browser reads as empty here,
     // and in the registry it marks the city's cinema gap as filled for good.
-    if (job.url && !inWindow.length) barren.set(job.url, job.source?.kind || 'other')
+    if (job.url && !inWindow.length && !productive.has(job.url)) barren.set(job.url, job.source?.kind || 'other')
     if (added > 0 && job.url) {
       barren.delete(job.url)
+      // A long listing is read in slices, so what it "covers" is every slice
+      // together, not whichever one finished last.
+      const soFar = (productive.get(job.url)?.found || 0) + inWindow.length
       productive.set(job.url, {
         url: job.url,
         name: job.source?.name || hostOf(job.url),
         kind: job.source?.kind || 'other',
-        covers: job.source?.covers || `${inWindow.length} events in one listing`,
+        covers: job.source?.covers || `${soFar} events in one listing`,
+        found: soFar,
       })
+    }
+
+    // The rest of this same page comes first: it is already fetched, and it is
+    // the one continuation we know for certain exists. A city film programme is
+    // one page with 41 cinemas on it, so stopping after the first slice is
+    // stopping after the letter C.
+    // The first slice gets a second slice even when it yielded nothing - the
+    // top of a listing is navigation, and the events start below it.
+    if (pageRest && (offset / SLICE_CHARS) + 1 < MAX_SLICES && (added > 0 || offset === 0)) {
+      queue.unshift({
+        source: job.source, url: job.url, page: job.page + 1, after: job.after,
+        depth: job.depth, offset: offset + SLICE_CHARS,
+      })
+      progress({ id, phase: 'harvest', label: `${label}: ${inWindow.length} events, ${added} new - reading on` })
+      return
     }
 
     // Next page of the same listing, as long as this one paid off.
@@ -737,6 +808,7 @@ export async function runScout(acc, {
 
   if (shouldStop()) stoppedBecause = 'stopped by you'
   else if (!(balance > 0)) stoppedBecause = 'out of credit'
+  else if (reasonIsFinal) { /* the job that stopped already said why */ }
   else if (calls.length >= maxCalls) stoppedBecause = 'call limit reached'
   else if (queue.length || !openWebRan) stoppedBecause = 'budget spent'
 

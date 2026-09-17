@@ -5,8 +5,9 @@ import {
   findDuplicate, runScout, makeGeocoder, zonedToSeconds, validZone, shortUrl,
   missingAngles, pageOf,
 } from '../src/scout.js'
-import { htmlToText, readPage, PageUnavailable } from '../src/reader.js'
-import { InsufficientBalance, keyName, KEY_NAME_MAX } from '../src/ppq.js'
+import { htmlToText, readPage, PageUnavailable, SLICE_CHARS } from '../src/reader.js'
+import { InsufficientBalance, keyName, KEY_NAME_MAX, getBalance } from '../src/ppq.js'
+import { isDatedUrl } from '../src/main.js'
 
 // ---------- parsing ----------
 
@@ -454,6 +455,67 @@ assert.equal(pageApi.opts[3].search, true, 'the open-web pass is still a search'
 assert.deepEqual(run.productive.map(s => s.url), [LIST, LIST + '?seite=2'],
   'the pages that held events go to the registry - the hub that held none does not')
 
+// A city-wide film programme is one page with every cinema on it -
+// in-muenchen.de/kino/alle-kinos.html is 191k characters, 41 cinemas, 661
+// showings. One extraction call sees 60k of that, so reading the page once is
+// reading the cinemas up to the letter C. It is read slice by slice instead,
+// and fetched only once: re-fetching costs a rate limit and risks the page
+// changing under us mid-run.
+{
+  const PROG = 'https://kino.test/alle-kinos'
+  const filler = (n) => Array.from({ length: n }, (_, i) => `Kino ${i} - Film ${i} - 20:00`).join('\n')
+  // Three slices' worth, with events on every one of them.
+  const whole = ['A' + filler(800), 'B' + filler(800), 'C' + filler(800)]
+    .map(part => part.padEnd(SLICE_CHARS, ' ')).join('')
+  const seen = []
+  let fetches = 0
+  const sliceRun = await runScout({}, {
+    city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+    sources: [{ url: PROG, name: 'Kinoprogramm', kind: 'cinema' }],
+    api: fakeApi({
+      answer: (p) => {
+        const body = (p.match(/--- page text of \S+ ---\n([\s\S]*)\n--- end of page ---/) || [])[1]
+        if (body === undefined) return harvest([])          // the open-web pass
+        seen.push(body[0])
+        return JSON.stringify({ tz: 'UTC', events: [ev('Film ' + body[0])] })
+      },
+    }),
+    fetchPage: async () => { fetches++; return whole },
+  })
+  assert.deepEqual(seen, ['A', 'B', 'C'], 'every slice of the programme is read, not just the first')
+  assert.equal(fetches, 1, 'a long page is fetched once and sliced, not re-fetched per slice')
+  assert.deepEqual(sliceRun.candidates.map(c => c.title).sort(), ['Film A', 'Film B', 'Film C'])
+  assert.deepEqual(sliceRun.productive.map(s => s.url), [PROG],
+    'the programme goes to the registry once, not once per slice')
+  assert.equal(sliceRun.productive[0].covers, '3 events in one listing',
+    'what it covers is every slice together')
+}
+
+// A first slice that is all navigation still earns a second look; a second one
+// that yields nothing ends the page.
+{
+  const NAV = 'https://nav.test/events'
+  const whole = 'menu '.repeat(SLICE_CHARS / 5) + 'Konzert 20:00' 
+  let calls = 0
+  const navRun = await runScout({}, {
+    city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+    sources: [{ url: NAV, name: 'Nav', kind: 'city' }],
+    api: fakeApi({
+      answer: (p) => {
+        if (!/--- page text of/.test(p)) return harvest([])
+        calls++
+        return calls === 1 ? harvest([]) : JSON.stringify({ tz: 'UTC', events: [ev('Konzert')] })
+      },
+    }),
+    fetchPage: async () => whole,
+  })
+  assert.equal(calls, 2, 'an empty first slice is followed by the second, where the events are')
+  assert.deepEqual(navRun.candidates.map(c => c.title), ['Konzert'])
+  assert.deepEqual(navRun.productive.map(s => s.url), [NAV],
+    'a page whose first slice was empty is still a catalogue if a later slice paid off')
+  assert.deepEqual(navRun.barren, [], 'and it is not filed as barren')
+}
+
 // A page that will not load is not a dead end: the run asks the model instead,
 // which is all it could ever do before.
 run = await runScout({}, {
@@ -552,3 +614,50 @@ for (const r of [Math.random(), 0.1, 0.999999]) {
 assert.notEqual(keyName(0.1), keyName(0.2))
 
 console.log('scout tests ok')
+
+
+// The credit balance is not the ceiling a run actually hits. The page mints a
+// capped sub-key, and that cap is lower: a $1 key on a $2 credit refuses every
+// call once it has spent its dollar, while /credits/balance still cheerfully
+// reports $2. The run then sees money it cannot spend, keeps starting calls
+// that come back 402, and finishes claiming "budget spent" when the truth is
+// that the key is used up. So a balance is the smaller of the two.
+{
+  const realFetch = globalThis.fetch
+  const json = (body) => ({ ok: true, status: 200, text: async () => JSON.stringify(body) })
+  globalThis.fetch = async (url) => url.endsWith('/credits/balance')
+    ? json({ balance: 2 })
+    : json({ status: 'success', data: [
+        { name: 'tonight-other', usage_limit_usd: 5, current_period_usage_usd: 0 },
+        { name: 'tonight-abc123', usage_limit_usd: 1, current_period_usage_usd: 0.87 },
+      ] })
+  try {
+    assert.equal(
+      await getBalance({ apiKey: 'sk-x', creditId: 'cid', keyName: 'tonight-abc123' }),
+      +(1 - 0.87).toFixed(10),
+      'the sub-key cap, not the credit, is what the run has left')
+    assert.equal(
+      await getBalance({ apiKey: 'sk-x', creditId: 'cid', keyName: 'tonight-gone' }),
+      2, 'a key we cannot find leaves the credit balance standing')
+    assert.equal(
+      await getBalance({ apiKey: 'sk-x' }), 2,
+      'a pasted api key with no credit id has no cap we can read')
+  } finally { globalThis.fetch = realFetch }
+}
+
+console.log('balance ceiling tests ok')
+
+// A page that was a fine catalogue for one evening and a dead link every
+// evening after does not belong in a registry that outlives the run.
+for (const u of [
+  'https://www.kino-zeit.de/kinoprogramm/ort/M%C3%BCnchen/tag/17-09-2026',
+  'https://x.de/events/2026-09-17', 'https://x.de/e/17.09.2026', 'https://x.de/p/20260917',
+]) assert.ok(isDatedUrl(u), `day-specific: ${u}`)
+for (const u of [
+  'https://allekinos.de/programm?stadt=M%C3%BCnchen',
+  'https://www.muenchen.de/veranstaltungen/event/heute',
+  'https://www.in-muenchen.de/kino/alle-kinos.html',
+  'https://www.cinema.de/index.php/kino/kinoprogramm/muenchen',
+]) assert.ok(!isDatedUrl(u), `stays true tomorrow: ${u}`)
+
+console.log('dated url tests ok')

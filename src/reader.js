@@ -13,7 +13,15 @@
 // it and for the test harness, and the reader is the fallback.
 
 export const READER = 'https://r.jina.ai/'
-export const MAX_CHARS = 60000        // ~15k tokens, well inside the context and the budget
+// What one extraction call is shown. ~15k tokens, well inside the context and
+// the budget.
+export const SLICE_CHARS = 60000
+// What we keep of a page. A city-wide film programme is genuinely this long:
+// in-muenchen.de/kino/alle-kinos.html is 191k characters, 41 cinemas and 661
+// showings on one server-rendered page. Cutting it at one slice threw away 30
+// of those cinemas before the model ever saw them, so the fetch keeps the whole
+// thing and the run reads it a slice at a time.
+export const MAX_CHARS = 400000
 export const FETCH_TIMEOUT_MS = 30000
 
 export class PageUnavailable extends Error {
