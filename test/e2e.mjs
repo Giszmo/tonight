@@ -187,6 +187,10 @@ await m.waitForSelector('.budgets', { timeout: 60000 })
 const secondRun = (await m.textContent('#sheet-body')).replace(/\s+/g, ' ')
 console.log('second run sheet:', secondRun.slice(0, 200))
 assert.match(secondRun, /catalogues for München are already on the relays/, 'the registry is read back')
+// A registry with no film programme in it cannot buy a cinema at any budget, so
+// the gap is named on the button that would fill it, and ticked by default.
+assert.match(secondRun, /film programme nobody has found here yet/, 'the missing kind is named, not counted')
+assert.equal(await m.$eval('.check input', (n) => n.checked), true, 'and asking for it is the default')
 await m.screenshot({ path: SHOTS + '/10-registry.png' })
 await m.keyboard.press('Escape')
 

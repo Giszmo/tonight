@@ -13,7 +13,7 @@
 // work - it never opens the page - and that, not the budget, was why a Munich
 // run came back with one event from a portal that had forty-four that day.
 import { InsufficientBalance } from './ppq.js'
-import { dedupId, buildEventTags, sameEvent, KIND_TIME_EVENT, KIND_SCOUT_RUN } from './events.js'
+import { dedupId, buildEventTags, cityTags, sameEvent, KIND_TIME_EVENT, KIND_SCOUT_RUN } from './events.js'
 import { encodeGeohash, geohashPrefixes, slugify, geocodePlace } from './geo.js'
 import { readPage, sameHost, absolute } from './reader.js'
 
@@ -114,9 +114,30 @@ export const SOURCE_ANGLES = [
   },
 ]
 
+// What we already know is a list of pages, not a list of sites. Excluding whole
+// hosts is how a run that already had muenchen.de's front listing went looking
+// for "other" catalogues and stepped over muenchen.de's own today view - the one
+// page in the city with forty-four events on it that day.
+// Which angles the city's registry has nothing for. A registry that grew out of
+// one run answers for the kinds that run happened to ask about, and the gap is
+// invisible in a list of nine catalogues: Munich had a portal, a magazine and a
+// free-events site, no film programme at all, and so no run could find a cinema
+// however much budget it was given. A gap is worth one search on its own.
+const ANGLE_COVERED_BY = {
+  today: ['city', 'magazine'],
+  cinema: ['cinema'],
+  tickets: ['tickets'],
+  venues: ['venue', 'university'],
+}
+
+export function missingAngles(sources = []) {
+  const have = new Set(sources.map(s => String(s?.kind || '').toLowerCase()))
+  return SOURCE_ANGLES.filter(a => !(ANGLE_COVERED_BY[a.key] || [a.kind]).some(k => have.has(k)))
+}
+
 export function buildSourceMessages({ city, country, exclude = [], angle = null }) {
   const where = `${city}${country ? ', ' + country : ''}`
-  const known = exclude.map(s => hostOf(s.url || s)).filter(Boolean)
+  const known = [...new Set(exclude.map(s => pageOf(s.url || s)).filter(Boolean))].slice(0, 24)
   const ask = angle
     ? `Look for ${angle.ask.replace(/<city>/g, city)}\n`
     : 'Look for: the local what-is-on magazine or city guide, the municipality\'s own events calendar, ' +
@@ -127,7 +148,10 @@ export function buildSourceMessages({ city, country, exclude = [], angle = null 
       role: 'user',
       content:
         `List the web pages that catalogue public events in ${where}.\n` +
-        (known.length ? `We already know these and do not want them again: ${[...new Set(known)].join(', ')}. Find others.\n` : '') +
+        (known.length
+          ? `We already have these pages: ${known.join(', ')}. Do not return them again. ` +
+            'Another page of the same site is welcome as long as it is a different dated listing.\n'
+          : '') +
         ask +
         'Give the URL of the page that actually shows the list of dated events - a "today", "this week" or ' +
         'calendar view - not the section front page or the site homepage. A page that only links to other ' +
@@ -334,6 +358,15 @@ function hostOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, '') } catch { return '' }
 }
 
+// "muenchen.de/veranstaltungen/event/heute" - enough to tell two listings on one
+// site apart, without the query string.
+export function pageOf(url) {
+  try {
+    const u = new URL(String(url))
+    return u.hostname.replace(/^www\./, '') + u.pathname.replace(/\/$/, '')
+  } catch { return String(url || '').trim() }
+}
+
 // A run now visits several pages of the same host, so the host alone stops
 // telling the visitor which page a batch of events came from.
 const visitKey = (job) => `${String(job.url || '').replace(/#.*$/, '')}|${job.page}`
@@ -464,9 +497,9 @@ export async function runScout(acc, {
 
   const urlKey = (u) => String(u || '').replace(/#.*$/, '').replace(/\/$/, '')
 
-  async function discoverSources(exclude, label) {
+  async function discoverSources(exclude, label, angles = SOURCE_ANGLES) {
     progress({ phase: 'sources', label })
-    const perAngle = await Promise.all(SOURCE_ANGLES.map(async (angle) => {
+    const perAngle = await Promise.all(angles.map(async (angle) => {
       if (!affordable() || shouldStop()) return []
       try {
         const [res] = await withClaim(() => paidCall(
@@ -499,10 +532,19 @@ export async function runScout(acc, {
     return fresh
   }
 
+  // A registry with a hole in it is not a registry we can spend past: with no
+  // film programme on the relays, every cinema in the city is missing whatever
+  // the budget is. So when the city already has catalogues, the search goes
+  // after the kinds it does not have rather than asking the same four questions
+  // again.
+  const gaps = missingAngles(fromRegistry)
   if (wantDiscovery) {
+    const angles = fromRegistry.length && gaps.length ? gaps : SOURCE_ANGLES
     const found = await discoverSources(fromRegistry, fromRegistry.length
-      ? `looking for catalogues beyond the ${fromRegistry.length} we know`
-      : 'looking for the catalogues that cover ' + city)
+      ? (gaps.length
+        ? `${city} has no ${gaps.map(a => a.key).join(' and no ')} catalogue yet - looking`
+        : `looking for catalogues beyond the ${fromRegistry.length} we know`)
+      : 'looking for the catalogues that cover ' + city, angles)
     discovered.push(...found)
     usedSources = [...found, ...fromRegistry]
     progress({
@@ -715,7 +757,7 @@ export function makeGeocoder({ enabled = true, limit = 50, lookup = geocodePlace
   }
 }
 
-export async function candidateToEvent(identity, candidate, { city, lat, lon, tz = null, geocode = null }) {
+export async function candidateToEvent(identity, candidate, { city, aliases = [], lat, lon, tz = null, geocode = null }) {
   let place = null
   if (Number.isFinite(candidate.lat) && Number.isFinite(candidate.lon)) place = { lat: candidate.lat, lon: candidate.lon }
   else if (geocode) place = await geocode(candidate.venue, city)
@@ -736,6 +778,7 @@ export async function candidateToEvent(identity, candidate, { city, lat, lon, tz
       lat: coords.lat,
       lon: coords.lon,
       city,
+      aliases,
       category: candidate.category,
       url: candidate.url,
       tzid: tz,
@@ -743,9 +786,9 @@ export async function candidateToEvent(identity, candidate, { city, lat, lon, tz
   })
 }
 
-export async function scoutRunEvent(identity, run, publishedCount) {
+export async function scoutRunEvent(identity, run, publishedCount, { aliases = [] } = {}) {
   const tags = [
-    ['t', slugify(run.city)],
+    ...cityTags(run.city, aliases).map(t => ['t', t]),
     ['found', String(run.candidates.length)],
     ['published', String(publishedCount)],
     ['cost_usd', run.costUsd.toFixed(4)],

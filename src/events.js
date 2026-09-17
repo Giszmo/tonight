@@ -200,7 +200,7 @@ function rankCopies(a, b) {
 
 // Tag set for a newly published event. Multi-precision `g` is what makes it
 // findable by anyone else's "near me" query.
-export function buildEventTags({ d, title, summary, start, end, venue, address, lat, lon, city, category, url, image, tzid }) {
+export function buildEventTags({ d, title, summary, start, end, venue, address, lat, lon, city, aliases = [], category, url, image, tzid }) {
   const tags = [
     ['d', d],
     ['title', title],
@@ -214,20 +214,33 @@ export function buildEventTags({ d, title, summary, start, end, venue, address, 
   if (Number.isFinite(lat) && Number.isFinite(lon)) {
     for (const g of geohashPrefixes(encodeGeohash(lat, lon, 8), 2, 8)) tags.push(['g', g])
   }
-  if (city) {
-    tags.push(['t', slugify(city)])
-    if (slugify(city) !== String(city).toLowerCase()) tags.push(['t', String(city).toLowerCase()])
-  }
+  for (const t of cityTags(city, aliases)) tags.push(['t', t])
   if (category) tags.push(['t', slugify(category)])
   if (url) tags.push(['r', url])
   tags.push(['alt', `${title} - ${venue || city || ''}`])
   return tags
 }
 
+// One city, one set of hashtags. Whoever types "Munich" and whoever types
+// "Muenchen" are looking at the same place, and the geohash says so - so an
+// event published under either label also carries the labels the city already
+// goes by on the relays. Without that, one spelling quietly forks the city into
+// two half-empty listings for anyone who reads by hashtag alone.
+export function cityTags(city, aliases = []) {
+  const out = []
+  for (const name of [city, ...aliases]) {
+    if (!name) continue
+    for (const t of [slugify(name), String(name).toLowerCase()]) {
+      if (t && !out.includes(t)) out.push(t)
+    }
+  }
+  return out.slice(0, 6)
+}
+
 // A scouting source: one catalogue page that lists events for a city. Finding
 // them costs a paid search, so the finder publishes them and the next visitor
 // spends their money on events instead of on the same question.
-export function buildSourceTags({ url, name, kind, covers, city, lat, lon }) {
+export function buildSourceTags({ url, name, kind, covers, city, aliases = [], lat, lon }) {
   const tags = [
     ['d', sourceDTag(url)],
     ['r', url],
@@ -235,7 +248,7 @@ export function buildSourceTags({ url, name, kind, covers, city, lat, lon }) {
   ]
   if (kind) tags.push(['source_kind', kind])
   if (covers) tags.push(['summary', covers])
-  if (city) tags.push(['t', slugify(city)])
+  for (const t of cityTags(city, aliases)) tags.push(['t', t])
   if (Number.isFinite(lat) && Number.isFinite(lon)) {
     for (const g of geohashPrefixes(encodeGeohash(lat, lon, 5), 2, 5)) tags.push(['g', g])
   }
@@ -257,6 +270,7 @@ export function parseSourceEvent(ev) {
     name: tagValue(ev, 'title') || sourceDTag(url),
     kind: tagValue(ev, 'source_kind') || 'other',
     covers: tagValue(ev, 'summary') || '',
+    cities: ev.tags.filter(t => t[0] === 't').map(t => t[1]).filter(Boolean),
     pubkey: ev.pubkey,
     createdAt: ev.created_at,
   }

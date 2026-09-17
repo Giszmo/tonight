@@ -3,6 +3,7 @@ import {
   parseCandidates, parseHarvest, parseSources, buildHarvestMessages, buildSourceMessages, SOURCE_ANGLES,
   repairTruncatedJson,
   findDuplicate, runScout, makeGeocoder, zonedToSeconds, validZone, shortUrl,
+  missingAngles, pageOf,
 } from '../src/scout.js'
 import { htmlToText, readPage, PageUnavailable } from '../src/reader.js'
 import { InsufficientBalance } from '../src/ppq.js'
@@ -92,8 +93,32 @@ assert.equal(parseSources(JSON.stringify({ sources: [
 ] }), { perHost: 1 }).length, 1, 'the per-host cap is settable')
 
 assert.match(buildSourceMessages({ city: 'Traunstein', country: 'Germany' })[1].content, /Traunstein, Germany/)
-const expand = buildSourceMessages({ city: 'München', exclude: [{ url: 'https://www.in-muenchen.de/x' }] })[1].content
-assert.match(expand, /already know these.*in-muenchen\.de/s, 'an expansion search asks for catalogues we do not have')
+// What we already have is a page, not a site. Excluding the host is how a run
+// that held muenchen.de's front listing asked for "other" catalogues and so
+// ruled out muenchen.de's own today view, the one page with the day on it.
+const expand = buildSourceMessages({
+  city: 'München',
+  exclude: [{ url: 'https://www.muenchen.de/veranstaltungen/events?x=1' }],
+})[1].content
+assert.match(expand, /muenchen\.de\/veranstaltungen\/events/, 'the known page is named in full')
+assert.doesNotMatch(expand, /muenchen\.de\/veranstaltungen\/events\?/, 'without its query string')
+assert.match(expand, /same site is welcome/, 'another listing on a known host is still wanted')
+assert.equal(pageOf('https://www.muenchen.de/veranstaltungen/event/heute/'), 'muenchen.de/veranstaltungen/event/heute')
+
+// A registry that grew out of one run answers only for the kinds that run asked
+// about. Munich's nine catalogues had no film programme in them at all, so no
+// budget could buy a cinema: the gap has to be visible as a gap.
+const munichRegistry = [
+  { url: 'https://muenchen.de/veranstaltungen/events', kind: 'city' },
+  { url: 'https://in-muenchen.de/veranstaltungen', kind: 'magazine' },
+  { url: 'https://gasteig.de/veranstaltungen', kind: 'venue' },
+]
+assert.deepEqual(missingAngles(munichRegistry).map(a => a.key), ['cinema', 'tickets'])
+assert.deepEqual(missingAngles([...munichRegistry, { url: 'https://kino.de/m', kind: 'cinema' }]).map(a => a.key),
+  ['tickets'])
+assert.equal(missingAngles([]).length, SOURCE_ANGLES.length, 'an empty registry is missing everything')
+assert.equal(missingAngles([{ url: 'https://x.de', kind: 'university' }]).map(a => a.key).includes('venues'), false,
+  'a university calendar counts as a venue programme')
 
 // Discovery is several narrow searches, not one broad one: the broad form finds
 // an expat blog and one arthouse cinema, the cinema angle finds the city's film
@@ -280,6 +305,30 @@ assert.deepEqual(run.discovered.map(s => s.name), ['Three'], 'only genuinely new
 assert.deepEqual(run.sources.map(s => s.name), ['Three', 'One'], 'the unexplored one is walked first')
 assert.ok(run.calls.some(c => c.label === 'three.test/events'), 'the new catalogue is actually read in the same run')
 
+// A city whose registry covers some kinds and not others pays for the holes
+// only. Munich's registry had a portal, a magazine and a concert hall in it and
+// no film programme at all, and asking all four questions again would have
+// bought three answers it already had.
+const gapApi = fakeApi({
+  answer: (p) => /List the web pages that catalogue/.test(p)
+    ? JSON.stringify({ sources: [{ name: 'Kino', url: 'https://kino.test/heute', kind: 'cinema' }] })
+    : harvest([ev('Film')]),
+})
+run = await runScout({}, { fetchPage: offline,
+  city: 'Testheim', from: FROM, to: TO, budgetUsd: 1, discover: 'always',
+  sources: [
+    { url: 'https://one.test/events', name: 'One', kind: 'city' },
+    { url: 'https://hall.test/programm', name: 'Hall', kind: 'venue' },
+  ],
+  api: gapApi,
+})
+// (a later round can still ask everything: once the queue is empty and the
+// money is not, the run is out of places to look, not short of one kind)
+const asked = run.calls.filter(c => c.label.startsWith('catalogues:')).map(c => c.label.slice('catalogues:'.length))
+assert.deepEqual(asked.slice(0, 2).sort(), ['cinema', 'tickets'],
+  'the first round searches only for the kinds the city has nothing for')
+assert.ok(run.calls.some(c => c.label === 'kino.test/heute'), 'and the film programme it found is read')
+
 
 // A run that walks out of catalogues with most of the money untouched has not
 // covered the city, it has run out of places to look. Munich stopped at
@@ -290,9 +339,9 @@ run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
   api: fakeApi({ answer: (p) => {
     if (/List the web pages that catalogue/.test(p)) {
-      if (!/already know these/.test(p)) return JSON.stringify({ sources: [{ name: 'One', url: 'https://one.test/events' }] })
+      if (!/already have these pages/.test(p)) return JSON.stringify({ sources: [{ name: 'One', url: 'https://one.test/events' }] })
       expansionAsks++
-      assert.match(p, /already know these.*one\.test/s, 'the second round names what has been tried')
+      assert.match(p, /already have these pages.*one\.test\/events/s, "the second round names what has been tried")
       return JSON.stringify({ sources: [{ name: 'Late', url: 'https://late.test/events' }] })
     }
     return harvest([ev('Show from ' + (p.match(/https:\/\/(\w+)\.test/) || [])[1])])

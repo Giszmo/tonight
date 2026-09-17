@@ -8,7 +8,9 @@ import { groupCopies, groupHasTag } from './events.js'
 import { haversineKm, geocodeCity, slugify } from './geo.js'
 import * as realPpq from './ppq.js'
 import { mockPpq } from './mockppq.js'
-import { runScout, candidateToEvent, scoutRunEvent, findDuplicate, makeGeocoder } from './scout.js'
+import {
+  runScout, candidateToEvent, scoutRunEvent, findDuplicate, makeGeocoder, missingAngles,
+} from './scout.js'
 import qrcode from 'qrcode-generator'
 
 // ?mock=1 swaps in a fake PPQ so the whole paid path can be driven without
@@ -174,7 +176,7 @@ async function load() {
   render()
   const [events, runs, sources] = await Promise.all([
     fetchCityEvents({ lat: place.lat, lon: place.lon, city: place.name, from: win.from, to: win.to }),
-    fetchScoutRuns(place.name),
+    fetchScoutRuns(place.name, { lat: place.lat, lon: place.lon }),
     fetchSources(place.name, { lat: place.lat, lon: place.lon }),
   ])
   state.runs = runs
@@ -262,6 +264,21 @@ function renderIdent() {
     text: (id.mode === 'nip07' ? 'signer · ' : 'guest key · ') + short,
     onclick: openIdentitySheet,
   }))
+}
+
+// The other names this city already goes by on the relays. Catalogues and runs
+// are found by geohash, so they answer for the place whatever the visitor typed
+// into the city box - and what they were published under is what this visitor's
+// own events should also carry, or "Munich" and "München" become two listings
+// of the same evening.
+function cityAliases() {
+  const slug = slugify(currentPlace().name)
+  const out = []
+  for (const name of [...state.sources.flatMap(s => s.cities || []), ...state.runs.map(r => r.city)]) {
+    const t = slugify(name)
+    if (t && t !== slug && !out.includes(t)) out.push(t)
+  }
+  return out.slice(0, 3)
 }
 
 function renderRunInfo() {
@@ -576,10 +593,17 @@ function openScoutSheet(acc) {
   let budget = options.includes(0.25) ? 0.25 : options[options.length - 1]
 
   // The catalogue registry is the cheap path; paying to look for more of them
-  // is worth it when the city is new to us or the list has gone quiet.
+  // is worth it when the city is new to us, when the list has gone quiet, and -
+  // the case that cost Munich every one of its cinemas - when the registry holds
+  // no catalogue at all of some kind, because then no budget whatsoever buys
+  // those events. A gap is named here rather than hidden behind a count.
   const newest = state.sources.length ? Math.max(...state.sources.map(s => s.createdAt || 0)) : 0
   const staleDays = newest ? (Date.now() / 1000 - newest) / 86400 : Infinity
-  const expandBox = el('input', { type: 'checkbox', checked: state.sources.length < 4 || staleDays > 30 })
+  const gaps = state.sources.length ? missingAngles(state.sources) : []
+  const expandBox = el('input', {
+    type: 'checkbox',
+    checked: state.sources.length < 4 || staleDays > 30 || gaps.length > 0,
+  })
 
   const yieldLine = el('p', { class: 'dim' })
   const chips = el('p', { class: 'budgets' })
@@ -603,9 +627,12 @@ function openScoutSheet(acc) {
     el('p', { class: 'dim', text: `${state.groups.length} events are already listed here. They go into the search as "skip these" and are filtered out again, so you pay for what is missing.` }),
     el('p', {}, el('label', { class: 'check' },
       expandBox,
-      el('span', { text: state.sources.length
-        ? 'also look for catalogues we do not know yet (one extra call)'
-        : 'find the catalogues first (one call)' }),
+      el('span', { text: !state.sources.length
+        ? 'find the catalogues first (one call)'
+        : gaps.length
+          ? `look for the ${gaps.map(a => GAP_LABEL[a.key] || a.key).join(' and the ')} nobody has found here yet ` +
+            `(${gaps.length} extra ${gaps.length === 1 ? 'call' : 'calls'})`
+          : 'also look for catalogues we do not know yet (one extra call)' }),
     )),
     el('h2', { text: 'Spend at most' }),
     chips,
@@ -616,6 +643,15 @@ function openScoutSheet(acc) {
     ),
     el('p', { class: 'dim', text: `Balance ${usd(state.balance)}. You see every candidate before anything is published, and you sign what you publish.` }),
   )
+}
+
+// What a missing angle is called in front of a visitor, who does not think in
+// catalogue kinds.
+const GAP_LABEL = {
+  today: 'day-by-day city calendar',
+  cinema: 'film programme',
+  tickets: 'ticket listings',
+  venues: 'venue programmes',
 }
 
 const hostLabel = (url) => { try { return new URL(url).hostname.replace(/^www\./, '') } catch { return url } }
@@ -765,7 +801,9 @@ async function publishCandidates(run, picked, msg) {
   msg.textContent = `publishing 0/${picked.length}…`
   await inPool(picked, 4, async (c) => {
     try {
-      const signed = await candidateToEvent(state.identity, c, { city: run.city, lat: run.lat, lon: run.lon, tz: run.tz, geocode })
+      const signed = await candidateToEvent(state.identity, c, {
+        city: run.city, aliases: cityAliases(), lat: run.lat, lon: run.lon, tz: run.tz, geocode,
+      })
       await publish(signed)
       ok++
     } catch (err) { failed++; console.error('publish failed', c.title, err) }
@@ -780,10 +818,13 @@ async function publishCandidates(run, picked, msg) {
   const registry = new Map()
   for (const s of [...(run.discovered || []), ...(run.productive || [])]) if (s?.url) registry.set(s.url, s)
   if (registry.size) {
-    try { await publishSources(state.identity, [...registry.values()].slice(0, 12), { city: run.city, lat: run.lat, lon: run.lon }) }
+    try {
+      await publishSources(state.identity, [...registry.values()].slice(0, 12),
+        { city: run.city, aliases: cityAliases(), lat: run.lat, lon: run.lon })
+    }
     catch (err) { console.warn('source registry publish failed', err) }
   }
-  try { await publish(await scoutRunEvent(state.identity, run, ok)) }
+  try { await publish(await scoutRunEvent(state.identity, run, ok, { aliases: cityAliases() })) }
   catch (err) { console.error('scout run record failed', err) }
 
   msg.textContent = `Published ${ok}${failed ? `, ${failed} failed` : ''}. Everyone reading ${run.city} now sees them.`

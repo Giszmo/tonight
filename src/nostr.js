@@ -148,10 +148,20 @@ export async function fetchFollows(pubkey) {
   return new Set(latest.tags.filter(t => t[0] === 'p').map(t => t[1]))
 }
 
-export async function fetchScoutRuns(city) {
+// Runs are found the same way events and catalogues are: by where the city is,
+// not only by what this visitor called it. Looking them up by hashtag alone is
+// how a page told somebody who typed "Munich" that nobody had ever scouted it
+// while it was showing them Munich's events and its nine catalogues.
+export async function fetchScoutRuns(city, { lat, lon } = {}) {
   const tags = [slugify(city), String(city || '').toLowerCase()].filter((v, i, a) => v && a.indexOf(v) === i)
-  const evs = await query({ kinds: [KIND_SCOUT_RUN], '#t': tags, limit: 100 })
-  return evs
+  const filters = [{ kinds: [KIND_SCOUT_RUN], '#t': tags, limit: 100 }]
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    filters.push({ kinds: [KIND_SCOUT_RUN], '#g': geohashPrefixes(encodeGeohash(lat, lon, 5), 4, 5), limit: 100 })
+  }
+  const batches = await Promise.all(filters.map(f => query(f)))
+  const byId = new Map()
+  for (const batch of batches) for (const ev of batch) byId.set(ev.id, ev)
+  return [...byId.values()]
     .map(ev => ({
       pubkey: ev.pubkey,
       at: ev.created_at,
@@ -160,6 +170,7 @@ export async function fetchScoutRuns(city) {
       costUsd: parseFloat((ev.tags.find(t => t[0] === 'cost_usd') || [])[1] || 'NaN'),
       model: (ev.tags.find(t => t[0] === 'model') || [])[1] || '',
       summary: ev.content,
+      city: (ev.tags.find(t => t[0] === 't') || [])[1] || '',
     }))
     .sort((a, b) => b.at - a.at)
 }
@@ -204,7 +215,7 @@ export async function fetchSources(city, { lat, lon } = {}) {
 
 export const MAX_SOURCES_PER_HOST = 4
 
-export async function publishSources(identity, sources, { city, lat, lon }) {
+export async function publishSources(identity, sources, { city, aliases = [], lat, lon }) {
   let ok = 0
   for (const s of sources) {
     if (!s?.url) continue
@@ -213,7 +224,7 @@ export async function publishSources(identity, sources, { city, lat, lon }) {
         kind: KIND_SOURCE,
         created_at: Math.floor(Date.now() / 1000),
         content: s.covers || '',
-        tags: buildSourceTags({ url: s.url, name: s.name, kind: s.kind, covers: s.covers, city, lat, lon }),
+        tags: buildSourceTags({ url: s.url, name: s.name, kind: s.kind, covers: s.covers, city, aliases, lat, lon }),
       }))
       ok++
     } catch (err) { console.warn('source publish failed', s.url, err) }

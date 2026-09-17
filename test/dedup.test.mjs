@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
-import { dedupId, groupCopies, groupHasTag, groupTags, sameEvent, normalizeTitle } from '../src/events.js'
+import {
+  dedupId, groupCopies, groupHasTag, groupTags, sameEvent, normalizeTitle,
+  cityTags, buildEventTags, buildSourceTags,
+} from '../src/events.js'
 
 const mk = (o) => ({ id: o.id || Math.random().toString(36).slice(2), d: o.d || '', address: o.address || '',
   title: o.title, venue: o.venue || '', start: o.start, coords: o.coords || null, refs: o.refs || [],
@@ -65,3 +68,26 @@ assert.equal(groupHasTag(concertGroup, 'cinema'), false)
 assert.equal(groupHasTag(concertGroup, null), true, 'no filter keeps everything')
 assert.equal(tg.filter(g => groupHasTag(g, 'concert')).length, 1, 'filtering a list keeps one card')
 console.log('tag filter tests ok')
+
+// ---------- one city, whoever spells it how ----------
+
+// "Munich" and "München" are the same evening. Catalogues, runs and events are
+// all found by geohash, so a run started under one spelling publishes under the
+// labels the city already goes by too - otherwise a visitor who reads by
+// hashtag alone sees half of the city, twice.
+assert.deepEqual(cityTags('München'), ['munchen', 'münchen'])
+assert.deepEqual(cityTags('Munich', ['munchen']), ['munich', 'munchen'])
+assert.deepEqual(cityTags('Munich', ['munich', 'Munich']), ['munich'], 'an alias that says the same thing is dropped')
+assert.deepEqual(cityTags(''), [], 'no city, no city tag')
+assert.ok(cityTags('A', ['b', 'c', 'd', 'e', 'f', 'g']).length <= 6, 'the tag list stays bounded')
+
+const tags = buildEventTags({
+  d: 'x', title: 'Konzert', start: 1789200000, city: 'Munich', aliases: ['munchen'], category: 'concert',
+})
+const ts = tags.filter(t => t[0] === 't').map(t => t[1])
+assert.deepEqual(ts, ['munich', 'munchen', 'concert'], 'both spellings and the category are hashtags')
+
+const src = buildSourceTags({ url: 'https://kino.test/heute', city: 'Munich', aliases: ['munchen'] })
+assert.deepEqual(src.filter(t => t[0] === 't').map(t => t[1]), ['munich', 'munchen'],
+  'a catalogue published under one spelling is found under the other')
+console.log('city tag tests ok')
