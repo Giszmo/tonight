@@ -410,6 +410,22 @@ export function pageOf(url) {
   } catch { return String(url || '').trim() }
 }
 
+// One segment up from a page that gave us nothing. Lisbon's film programme is
+// cinematimes.com/pt/lisbon; discovery handed the run
+// cinematimes.com/pt/lisbon/cinemas, which lists 40 cinemas and not one
+// showtime, and the city lost its whole cinema to that one path segment - while
+// Porto, on the same site, happened to be found one level up and got 17
+// showings. The site root is not a listing, so a page one segment deep has no
+// parent worth trying.
+export function parentListing(url) {
+  let u
+  try { u = new URL(String(url)) } catch { return null }
+  const parts = u.pathname.split('/').filter(Boolean)
+  if (parts.length < 2) return null
+  parts.pop()
+  return `${u.origin}/${parts.join('/')}`
+}
+
 // A run now visits several pages of the same host, so the host alone stops
 // telling the visitor which page a batch of events came from.
 const visitKey = (job) => `${String(job.url || '').replace(/#.*$/, '')}|${job.page}`
@@ -712,6 +728,19 @@ export async function runScout(acc, {
     // film page that renders its showtimes in the browser reads as empty here,
     // and in the registry it marks the city's cinema gap as filled for good.
     if (job.url && !inWindow.length && !productive.has(job.url)) barren.set(job.url, job.source?.kind || 'other')
+    // A page we read and found nothing on may be one segment too deep - see
+    // parentListing. One try, from a page we actually read, and never from a
+    // page that is itself a parent we followed.
+    if (pageText && job.url && !inWindow.length && job.page === 1 && !offset && job.depth < 1) {
+      const up = parentListing(job.url)
+      if (up && !visited.has(visitKey({ url: up, page: 1 }))) {
+        queue.push({
+          source: { ...job.source, url: up, name: job.source?.name || hostOf(up) },
+          url: up, page: 1, after: null, depth: job.depth + 1,
+        })
+        progress({ id, phase: 'harvest', label: `${label}: nothing on it, trying ${shortUrl(up)}` })
+      }
+    }
     if (added > 0 && job.url) {
       barren.delete(job.url)
       // A long listing is read in slices, so what it "covers" is every slice

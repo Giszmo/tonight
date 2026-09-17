@@ -3,7 +3,7 @@ import {
   parseCandidates, parseHarvest, parseSources, buildHarvestMessages, buildSourceMessages, SOURCE_ANGLES,
   repairTruncatedJson,
   findDuplicate, runScout, makeGeocoder, zonedToSeconds, validZone, shortUrl,
-  missingAngles, pageOf, dayZoneForLongitude,
+  missingAngles, pageOf, dayZoneForLongitude, parentListing,
 } from '../src/scout.js'
 import { htmlToText, readPage, PageUnavailable, SLICE_CHARS } from '../src/reader.js'
 import { InsufficientBalance, keyName, KEY_NAME_MAX, getBalance } from '../src/ppq.js'
@@ -664,6 +664,57 @@ console.log('scout tests ok')
 }
 
 console.log('balance ceiling tests ok')
+
+// A catalogue found one segment too deep is a city losing a whole kind of
+// event. Discovery handed the Lisbon run cinematimes.com/pt/lisbon/cinemas - a
+// list of 40 cinemas with no showtime on it - while Porto, on the same site,
+// was found at /pt/porto and got 17 showings. A page we read that yields
+// nothing is tried one level up before the run gives up on it.
+assert.equal(parentListing('https://cinematimes.com/pt/lisbon/cinemas/'), 'https://cinematimes.com/pt/lisbon')
+assert.equal(parentListing('https://x.test/a/b?when=today'), 'https://x.test/a')
+assert.equal(parentListing('https://x.test/events'), null, 'the site root is not a listing')
+assert.equal(parentListing('https://x.test/'), null)
+assert.equal(parentListing('not a url'), null)
+
+{
+  const DEEP = 'https://kino.test/pt/lisbon/cinemas'
+  const UP = 'https://kino.test/pt/lisbon'
+  const pages = { [DEEP]: 'Cinema Ideal - 13 showtimes today', [UP]: 'Cinema Ideal - Happy End 20:30' }
+  const fetched = []
+  const upRun = await runScout({}, {
+    city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+    sources: [{ url: DEEP, name: 'Kinoprogramm', kind: 'cinema' }],
+    fetchPage: async (u) => { fetched.push(u); if (!pages[u]) throw new PageUnavailable(u, '404'); return pages[u] },
+    api: fakeApi({
+      answer: (p) => {
+        const url = (p.match(/--- page text of (\S+) ---/) || [])[1]
+        if (url === UP) return JSON.stringify({ tz: 'UTC', events: [ev('Happy End')] })
+        if (url) return JSON.stringify({ tz: 'UTC', events: [] })
+        return harvest([])    // the open-web pass
+      },
+    }),
+  })
+  assert.ok(fetched.includes(UP), 'the parent of an empty page is tried')
+  assert.deepEqual(upRun.candidates.map(c => c.title), ['Happy End'],
+    'and what it holds is what the city gets')
+  assert.deepEqual(upRun.productive.map(s => s.url), [UP],
+    'the parent goes to the registry, the empty page it came from does not')
+}
+
+{
+  // One try, not a walk up the whole path: the parent's parent is never asked.
+  const fetched = []
+  const climbRun = await runScout({}, {
+    city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+    sources: [{ url: 'https://x.test/a/b/c', name: 'Deep', kind: 'cinema' }],
+    fetchPage: async (u) => { fetched.push(u); return 'nothing here' },
+    api: fakeApi({ answer: (p) => /--- page text of/.test(p) ? JSON.stringify({ tz: 'UTC', events: [] }) : harvest([]) }),
+  })
+  assert.deepEqual(fetched, ['https://x.test/a/b/c', 'https://x.test/a/b'], 'one level up, once')
+  assert.equal(climbRun.candidates.length, 0)
+}
+
+console.log('parent listing tests ok')
 
 // A page that was a fine catalogue for one evening and a dead link every
 // evening after does not belong in a registry that outlives the run.
