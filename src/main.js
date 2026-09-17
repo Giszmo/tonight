@@ -592,17 +592,20 @@ async function doScout(acc, budgetUsd, discover = 'auto') {
     el('p', {}, stopBtn),
   )
 
-  const onProgress = ({ phase, label, spent, budget, found }) => {
+  // Several catalogues are read at once, so a line belongs to its job rather
+  // than to the bottom of the list: "fetching X" turns into "X: 12 events" in
+  // place, while the other two carry on next to it.
+  const jobLines = new Map()
+  const onProgress = ({ id, phase, label, spent, budget, found }) => {
     head.textContent = `${usd(spent)} of ${usd(budget)} spent · ${found} new events so far`
     fill.style.width = Math.min(100, (spent / (budget || 1)) * 100).toFixed(1) + '%'
-    if (label && phase !== 'done') {
-      const last = lines.lastElementChild
-      if (last && last.dataset.pending === '1') last.remove()
-      const li = el('li', { text: label })
-      if (/^reading /.test(label) || /^looking for/.test(label)) li.dataset.pending = '1'
-      lines.append(li)
-      lines.scrollTop = lines.scrollHeight
-    }
+    if (!label || phase === 'done') return
+    const existing = id && jobLines.get(id)
+    if (existing) { existing.textContent = label; return }
+    const li = el('li', { text: label })
+    if (id) jobLines.set(id, li)
+    lines.append(li)
+    lines.scrollTop = lines.scrollHeight
   }
 
   try {
@@ -618,6 +621,9 @@ async function doScout(acc, budgetUsd, discover = 'auto') {
       discover,
       budgetUsd,
       api: ppq,
+      // ?mock=1 serves its catalogue pages from memory, so a demo run never
+      // hits a real site; a real run fetches them (src/reader.js).
+      fetchPage: ppq.fetchPage,
       onProgress,
       shouldStop: () => stop,
     })
@@ -714,10 +720,15 @@ async function publishCandidates(run, picked, msg) {
     msg.textContent = `publishing ${ok + failed}/${picked.length}…`
   })
 
-  // The catalogues this run discovered are worth more than the events: they
-  // turn the next visitor's first call into a harvest instead of a search.
-  if (run.discovered?.length) {
-    try { await publishSources(state.identity, run.discovered, { city: run.city, lat: run.lat, lon: run.lon }) }
+  // The catalogues this run walked are worth more than the events: they turn the
+  // next visitor's first call into a harvest instead of a search. What gets
+  // published is the page that actually held events - the dated listing, not the
+  // section front page the search engine offers - so nobody pays again to find
+  // the way from one to the other.
+  const registry = new Map()
+  for (const s of [...(run.discovered || []), ...(run.productive || [])]) if (s?.url) registry.set(s.url, s)
+  if (registry.size) {
+    try { await publishSources(state.identity, [...registry.values()].slice(0, 12), { city: run.city, lat: run.lat, lon: run.lon }) }
     catch (err) { console.warn('source registry publish failed', err) }
   }
   try { await publish(await scoutRunEvent(state.identity, run, ok)) }

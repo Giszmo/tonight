@@ -7,15 +7,29 @@
 // the time window is covered or the visitor's budget is spent. Everything the
 // city already has on the relays is fed in as "we have these" and filtered out
 // again on the way back, so a second run costs its money on what is missing.
+//
+// Walking a catalogue means fetching its pages and handing the model their text
+// (see reader.js). Asking a search-backed model to walk a listing does not
+// work - it never opens the page - and that, not the budget, was why a Munich
+// run came back with one event from a portal that had forty-four that day.
 import { InsufficientBalance } from './ppq.js'
 import { dedupId, buildEventTags, sameEvent, KIND_TIME_EVENT, KIND_SCOUT_RUN } from './events.js'
 import { encodeGeohash, geohashPrefixes, slugify, geocodePlace } from './geo.js'
+import { readPage, sameHost, absolute } from './reader.js'
 
 export const MAX_PER_CALL = 60          // events we ask for in one harvest call
-export const MAX_PAGES_PER_SOURCE = 3   // a catalogue may be walked this deep
+export const MAX_PAGES_PER_SOURCE = 4   // pages of one listing we follow
+export const MAX_DRILL = 6              // listing pages we follow off one hub
+export const CONCURRENCY = 3            // catalogues read at the same time
 export const FALLBACK_CALL_COST = 0.02  // used only until a run has measured one
 
 const EVENT_SHAPE = `{"title":"","start":"YYYY-MM-DDTHH:MM","end":"YYYY-MM-DDTHH:MM or null","venue":"","address":"","category":"concert|theatre|opera|cinema|club|exhibition|market|talk|sports|family|other","summary":"one or two sentences in the local language","url":"https://page-for-this-event"}`
+
+// Extraction from a page we supply must not wander off into the model's memory
+// of the city; that is how invented events get published.
+const EXTRACT_SYSTEM = 'You extract public events from the page text you are given. ' +
+  'Report only events that are written in that text. Never invent an event, a date or a venue, ' +
+  'and never add one from your own knowledge. Answer with JSON only, no prose, no code fence.'
 
 const SYSTEM = 'You are an events scout. You search the web and report only real, specific, verifiable public events. ' +
   'Never invent an event, a date or a venue. Every event must carry the URL of the page you found it on. ' +
@@ -66,9 +80,16 @@ export function buildSourceMessages({ city, country, exclude = [] }) {
         `List the web pages that catalogue public events in ${where}.\n` +
         (known.length ? `We already know these and do not want them again: ${known.join(', ')}. Find others.\n` : '') +
         'Look for: the local what-is-on magazine or city guide, the municipality\'s own events calendar, ' +
-        'regional ticket platforms, the programme pages of the largest venues (concert halls, theatres, clubs, cinemas), ' +
+        'regional ticket platforms, the programme pages of the largest venues (concert halls, theatres, clubs), ' +
         'and university or church calendars if they are public.\n' +
-        'Prefer a listing page that shows many events at once over a page about a single event. ' +
+        // A city portal's calendar carries concerts and theatre and no films at
+        // all, so cinema has to be asked for by name or a night out at the
+        // movies is simply missing from the city.
+        'Cinema is listed separately from everything else: include the page that shows the daily film showtimes ' +
+        'for this city (the local cinema programme, the arthouse cinemas\' own schedules, the multiplex chains).\n' +
+        'Give the URL of the page that actually shows the list of dated events - a "today", "this week" or ' +
+        'calendar view - not the section front page or the site homepage. A page that only links to other ' +
+        'listings is worth half as much as the listing itself.\n' +
         'Only pages you have actually seen in the search results; no guessed URLs.\n' +
         'Return JSON:\n' +
         '{"sources":[{"name":"","url":"https://…","kind":"magazine|city|tickets|venue|university|other","covers":"what it lists, one line"}]}\n' +
@@ -99,28 +120,49 @@ export function parseSources(text) {
 
 // ---------- stage 2: walk one catalogue ----------
 
-export function buildHarvestMessages({ city, country, from, to, source, known = [], page = 1, after = null }) {
+// Two shapes of the same question. When we managed to fetch the page, the page
+// is the only source allowed and the call is a pure extraction - no web search,
+// so it is cheaper as well as far more complete. When the fetch failed, or for
+// the open-web pass that catches what no catalogue lists, we fall back to the
+// search-backed form.
+export function buildHarvestMessages({
+  city, country, from, to, source, known = [], page = 1, after = null, pageText = null, url = null,
+}) {
   const where = `${city}${country ? ', ' + country : ''}`
-  const target = source?.url
-    ? `the events catalogue at ${source.url}${source.name ? ` (${source.name})` : ''}`
-    : `event listings for ${where} anywhere on the web`
+  const shape =
+    `Return up to ${MAX_PER_CALL} events as JSON in exactly this shape:\n` +
+    `{"tz":"IANA timezone of ${city}","events":[${EVENT_SHAPE}],` +
+    '"listing_urls":[],"next_url":"","more":true|false,"covered_until":"YYYY-MM-DDTHH:MM"}\n' +
+    `Times in "start", "end" and "covered_until" are ${city}'s own wall clock, and "tz" says which zone that is ` +
+    '(for example "Europe/Berlin"). Omit any event whose date or venue you are not sure about.'
+  const skip = known.length ? `Already published, skip these (times in UTC):\n${knownBlock(known)}\n` : ''
+  const oneEntry = 'One entry per event date: a run of performances on five evenings is five entries.\n'
+
+  const content = pageText
+    ? `Extract every public event in ${where} that starts between ${fmtStamp(from)} and ${fmtStamp(to)} ` +
+      `from the page below. It was fetched from ${url} moments ago.\n` +
+      'Use only what is in the page. Do not search, do not recall, do not add anything that is not written there. ' +
+      'Event URLs must be links that appear in the page.\n' +
+      oneEntry +
+      'If this page is an index or hub that links to listings instead of listing events itself, return no events ' +
+      'and put the URLs of its actual listing pages (a today/this week/calendar view, or per-category calendars) ' +
+      'into "listing_urls".\n' +
+      'If the listing is paginated and continues, put the URL of the next page into "next_url".\n' +
+      skip + shape +
+      `\n\n--- page text of ${url} ---\n${pageText}\n--- end of page ---`
+    : `Extract every public event in ${where} that starts between ${fmtStamp(from)} and ${fmtStamp(to)} from ` +
+      (source?.url
+        ? `the events catalogue at ${source.url}${source.name ? ` (${source.name})` : ''}`
+        : `event listings for ${where} anywhere on the web`) + '.\n' +
+      (page > 1
+        ? `This is pass ${page}. You already reported everything up to ${after ? fmtStamp(after) : 'the start of the window'}; continue after that point and do not repeat what you already sent.\n`
+        : '') +
+      oneEntry + skip + shape +
+      '\n"more" is true if there are events in the window you could not fit into this answer.'
+
   return [
-    { role: 'system', content: SYSTEM },
-    {
-      role: 'user',
-      content:
-        `Extract every public event in ${where} that starts between ${fmtStamp(from)} and ${fmtStamp(to)} from ${target}.\n` +
-        (page > 1
-          ? `This is pass ${page} over the same catalogue. You already reported everything up to ${after ? fmtStamp(after) : 'the start of the window'}; continue after that point and do not repeat what you already sent.\n`
-          : 'Walk the listing, including further pages and further days of the listing, not only the first screen.\n') +
-        'One entry per event date: a run of performances on five evenings is five entries.\n' +
-        (known.length ? `Already published, skip these (times in UTC):\n${knownBlock(known)}\n` : '') +
-        `Return up to ${MAX_PER_CALL} events as JSON in exactly this shape:\n` +
-        `{"tz":"IANA timezone of ${city}","events":[${EVENT_SHAPE}],"more":true|false,"covered_until":"YYYY-MM-DDTHH:MM"}\n` +
-        '"more" is true if the catalogue still holds events in the window that did not fit in this answer. ' +
-        `Times in "start", "end" and "covered_until" are ${city}'s own wall clock, and "tz" says which zone that is ` +
-        '(for example "Europe/Berlin"). Omit any event whose date or venue you are not sure about.',
-    },
+    { role: 'system', content: pageText ? EXTRACT_SYSTEM : SYSTEM },
+    { role: 'user', content },
   ]
 }
 
@@ -132,15 +174,24 @@ function knownBlock(known, max = 150) {
     .join('\n')
 }
 
-export function parseHarvest(text, { tz = null } = {}) {
+export function parseHarvest(text, { tz = null, base = null } = {}) {
   const data = parseJson(text)
-  const list = Array.isArray(data) ? data : (data.events || [])
-  const zone = validZone(Array.isArray(data) ? null : data.tz) || validZone(tz)
+  const obj = Array.isArray(data) ? {} : data
+  const list = Array.isArray(data) ? data : (obj.events || [])
+  const zone = validZone(obj.tz) || validZone(tz)
+  const link = (u) => {
+    const abs = typeof u === 'string' ? (base ? absolute(u, base) : u) : ''
+    return /^https?:\/\//.test(abs) && (!base || sameHost(abs, base)) ? abs : ''
+  }
   return {
     tz: zone,
     candidates: list.map(raw => normalizeCandidate(raw, zone)).filter(c => c && c.title && c.start),
-    more: Array.isArray(data) ? false : !!data.more,
-    coveredUntil: toSeconds(Array.isArray(data) ? null : data.covered_until, zone),
+    more: !!obj.more,
+    coveredUntil: toSeconds(obj.covered_until, zone),
+    // Only links on the same host: a hub's "listings" often include ad targets,
+    // and following those spends the visitor's money on a ticket shop's banner.
+    listingUrls: (Array.isArray(obj.listing_urls) ? obj.listing_urls : []).map(link).filter(Boolean).slice(0, 8),
+    nextUrl: link(obj.next_url),
   }
 }
 
@@ -198,6 +249,19 @@ function hostOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, '') } catch { return '' }
 }
 
+// A run now visits several pages of the same host, so the host alone stops
+// telling the visitor which page a batch of events came from.
+const visitKey = (job) => `${String(job.url || '').replace(/#.*$/, '')}|${job.page}`
+
+export function shortUrl(url, max = 38) {
+  try {
+    const u = new URL(url)
+    const path = u.pathname.replace(/\/$/, '')
+    const full = u.hostname.replace(/^www\./, '') + path + (u.search ? u.search : '')
+    return full.length > max ? full.slice(0, max - 1) + '…' : full
+  } catch { return String(url || '') }
+}
+
 // ---------- dedup against what the city already has ----------
 
 // sameEvent() works on parsed nostr events; a candidate is close enough once it
@@ -223,8 +287,8 @@ export function findDuplicate(candidate, list) {
 // cross the budget the visitor set.
 export async function runScout(acc, {
   city, country, lat, lon, from, to,
-  known = [], model, budgetUsd = 0.25, sources = null, discover = 'auto', maxCalls = 14,
-  api, onProgress = () => {}, shouldStop = () => false,
+  known = [], model, budgetUsd = 0.25, sources = null, discover = 'auto', maxCalls = 30,
+  api, onProgress = () => {}, shouldStop = () => false, fetchPage = readPage,
 }) {
   if (!api) throw new Error('runScout needs a PPQ api')
   const startedAt = Math.floor(Date.now() / 1000)
@@ -232,30 +296,71 @@ export async function runScout(acc, {
   if (!(balance > 0)) throw new InsufficientBalance()
 
   const budget = Math.min(budgetUsd, balance)
+  const startBalance = balance
   const calls = []
   const accepted = []
   const knownShapes = known.slice()
   let spent = 0
+  let reserved = 0     // estimated cost of the calls currently in flight
+  let inflight = 0
   let modelUsed = model || ''
   let cityZone = null
   let stoppedBecause = 'window covered'
 
   const estimate = () => (calls.length ? Math.max(...calls.map(c => c.costUsd), 0.001) : FALLBACK_CALL_COST)
-  const affordable = () => balance > 0 && spent + estimate() <= budget + 1e-9 && calls.length < maxCalls
+  // Under concurrency the budget has to be reserved before a call, not counted
+  // after it: three calls that each fit on their own must not all start when
+  // only two fit together.
+  const affordable = () => balance > 0 &&
+    spent + reserved + estimate() <= budget + 1e-9 &&
+    calls.length + inflight < maxCalls
   const progress = (extra = {}) => onProgress({
     spent, budget, balance, calls: calls.slice(), found: accepted.length, ...extra,
   })
 
-  // one paid call, cost measured from the balance delta
-  async function paidCall(label, messages, maxTokens) {
-    const before = balance
-    const res = await api.chat(acc, { model, messages, maxTokens })
-    try { balance = await api.getBalance(acc) } catch { /* keep the old figure rather than fail the run */ }
-    const costUsd = Math.max(0, +(before - balance).toFixed(5))
-    spent = +(spent + costUsd).toFixed(5)
-    modelUsed = res.model || modelUsed
-    calls.push({ label, costUsd })
-    return res
+  // Several calls in flight cannot each be priced from a balance delta, but the
+  // total can: the balance is absolute, so startBalance - balance is what the
+  // account has really been charged no matter how many calls are open. That
+  // figure is read after every call, because the budget check is only as good
+  // as the last reading, and the per-call numbers are the batch's share of it.
+  async function settle() {
+    const before = spent
+    try { balance = await api.getBalance(acc) } catch { return }
+    spent = Math.max(0, +(startBalance - balance).toFixed(5))
+    const open = calls.filter(c => c.estimated)
+    const share = open.length ? Math.max(0, +((spent - before) / open.length).toFixed(5)) : 0
+    for (const c of open) { c.costUsd = share; c.estimated = false }
+  }
+
+  // The claim is held for a whole job, not just for the call inside it: a job
+  // spends a second or two fetching its page before it spends any money, and
+  // three workers that check the budget during each other's fetches would all
+  // decide they fit.
+  async function withClaim(fn) {
+    const est = estimate()
+    reserved = +(reserved + est).toFixed(5)
+    inflight++
+    try {
+      return await fn()
+    } finally {
+      reserved = +(reserved - est).toFixed(5)
+      inflight--
+    }
+  }
+
+  async function paidCall(label, messages, maxTokens, opts = {}) {
+    const entry = { label, costUsd: estimate(), estimated: true }
+    calls.push(entry)
+    try {
+      const res = await api.chat(acc, { model, messages, maxTokens, ...opts })
+      modelUsed = res.model || modelUsed
+      return [res, entry]
+    } catch (err) {
+      entry.failed = true
+      throw err
+    } finally {
+      await settle()
+    }
   }
 
   // stage 1: the catalogues. The registry on the relays is the default answer -
@@ -271,7 +376,7 @@ export async function runScout(acc, {
       ? `looking for catalogues beyond the ${fromRegistry.length} we know`
       : 'looking for the catalogues that cover ' + city })
     try {
-      const res = await paidCall('catalogues', buildSourceMessages({ city, country, exclude: fromRegistry }), 2000)
+      const [res] = await withClaim(() => paidCall('catalogues', buildSourceMessages({ city, country, exclude: fromRegistry }), 2000))
       const knownHosts = new Set(fromRegistry.map(s => hostOf(s.url)))
       discovered = parseSources(res.text).filter(s => !knownHosts.has(hostOf(s.url))).slice(0, 10)
       usedSources = [...discovered, ...fromRegistry]
@@ -288,30 +393,57 @@ export async function runScout(acc, {
     })
   }
 
-  // stage 2: walk them, then one open-web pass to catch what no catalogue lists
-  const queue = usedSources.map(s => ({ source: s, page: 1, after: null }))
-  queue.push({ source: { name: 'open web search', url: '', kind: 'search' }, page: 1, after: null })
+  // stage 2: walk them, then one open-web pass to catch what no catalogue lists.
+  // Fetching a page is free, so the visitor's money goes into extraction only -
+  // a run with ten cents in it still reads whole listings.
+  const queue = usedSources.map(s => ({ source: s, url: s.url || '', page: 1, after: null, depth: 0 }))
+  const OPEN_WEB = { name: 'open web search', url: '', kind: 'search' }
 
-  while (queue.length && affordable() && !shouldStop()) {
-    const job = queue.shift()
-    const label = job.source.url ? hostOf(job.source.url) : 'open web'
-    progress({ phase: 'harvest', label: `reading ${label}${job.page > 1 ? ` (pass ${job.page})` : ''}` })
-    let harvest
-    const callsBefore = calls.length
+  const visited = new Set()
+  const productive = new Map()   // pages that actually yielded events, for the registry
+  let openWebRan = false
+
+  async function runJob(job) {
+    // Keyed by page as well as URL: a second pass over the same listing is a
+    // different question ("continue after X"), a second visit to the same first
+    // page is not.
+    if (job.url) {
+      if (visited.has(visitKey(job))) return
+      visited.add(visitKey(job))
+    }
+    const label = job.url ? shortUrl(job.url) : 'open web'
+    const id = `${label}|${job.page}`
+
+    // Read the page ourselves. A model with a web search attached never opens
+    // the listing; it answers from snippets, which is one or two events for a
+    // page that holds forty.
+    let pageText = null
+    if (job.url) {
+      progress({ id, phase: 'fetch', label: `fetching ${label}` })
+      try {
+        pageText = await fetchPage(job.url)
+      } catch (err) {
+        progress({ id, phase: 'fetch', label: `${label} would not load, asking the web instead` })
+      }
+    }
+
+    progress({ id, phase: 'harvest', label: `reading ${label}${job.page > 1 ? ` (page ${job.page})` : ''}` })
+    let harvest, entry
     try {
-      const res = await paidCall(label, buildHarvestMessages({
+      const [res, call] = await paidCall(label, buildHarvestMessages({
         city, country, from, to, source: job.source, page: job.page, after: job.after,
+        pageText, url: job.url || null,
         known: [...knownShapes, ...accepted.map(candidateShape)],
-      }), 8000)
-      harvest = parseHarvest(res.text, { tz: cityZone })
+      }), 8000, { search: !pageText })
+      entry = call
+      harvest = parseHarvest(res.text, { tz: cityZone, base: pageText ? job.url : null })
       if (harvest.tz) cityZone = harvest.tz
     } catch (err) {
-      if (err instanceof InsufficientBalance) { stoppedBecause = 'out of credit'; break }
+      if (err instanceof InsufficientBalance) { stoppedBecause = 'out of credit'; throw err }
       console.warn('harvest failed for ' + label, err)
-      // the call may have failed before it was ever charged for
-      if (calls.length > callsBefore) calls[calls.length - 1].failed = true
-      progress({ phase: 'harvest', label: `${label}: no usable answer` })
-      continue
+      if (entry) entry.failed = true
+      progress({ id, phase: 'harvest', label: `${label}: no usable answer` })
+      return
     }
 
     // An hour of slack for listings that round, no more: the window is what the
@@ -324,21 +456,76 @@ export async function runScout(acc, {
       accepted.push({ ...c, source: label })
       added++
     }
-    const last = calls[calls.length - 1]
-    if (last) { last.found = inWindow.length; last.added = added }
-    progress({ phase: 'harvest', label: `${label}: ${inWindow.length} events, ${added} new` })
+    if (entry) { entry.found = inWindow.length; entry.added = added }
 
-    // a catalogue that still has more gets another pass, as long as this one paid off
-    if (harvest.more && job.page < MAX_PAGES_PER_SOURCE && added > 0) {
-      const after = harvest.coveredUntil || inWindow.reduce((m, c) => Math.max(m, c.start), job.after || from)
-      queue.push({ source: job.source, page: job.page + 1, after })
+    // A hub - the section front page most catalogues advertise - lists no
+    // events itself. It names the pages that do, and those are what the next
+    // visitor should find in the registry, so they are followed now and
+    // published later.
+    if (harvest.listingUrls.length && !inWindow.length && job.depth < 1) {
+      const next = harvest.listingUrls.filter(u => !visited.has(visitKey({ url: u, page: 1 }))).slice(0, MAX_DRILL)
+      queue.unshift(...next.map(u => ({
+        source: { ...job.source, url: u, name: job.source?.name || hostOf(u) },
+        url: u, page: 1, after: null, depth: job.depth + 1,
+      })))
+      progress({ id, phase: 'harvest', label: next.length
+        ? `${label} is an index, following ${next.length} ${next.length === 1 ? 'listing' : 'listings'} it points at`
+        : `${label}: nothing to follow` })
+      return
     }
+
+    progress({ id, phase: 'harvest', label: `${label}: ${inWindow.length} events, ${added} new` })
+    if (added > 0 && job.url) {
+      productive.set(job.url, {
+        url: job.url,
+        name: job.source?.name || hostOf(job.url),
+        kind: job.source?.kind || 'other',
+        covers: job.source?.covers || `${inWindow.length} events in one listing`,
+      })
+    }
+
+    // Next page of the same listing, as long as this one paid off.
+    if (job.page < MAX_PAGES_PER_SOURCE && added > 0) {
+      if (harvest.nextUrl && !visited.has(visitKey({ url: harvest.nextUrl, page: job.page + 1 }))) {
+        queue.push({ source: job.source, url: harvest.nextUrl, page: job.page + 1, after: null, depth: job.depth })
+      } else if (harvest.more && !pageText) {
+        const after = harvest.coveredUntil || inWindow.reduce((m, c) => Math.max(m, c.start), job.after || from)
+        queue.push({ source: job.source, url: job.url, page: job.page + 1, after, depth: job.depth })
+      }
+    }
+  }
+
+  // Catalogues are independent of each other, so they are read at the same
+  // time; the visitor watches one list fill instead of waiting out ten round
+  // trips end to end. The budget is what bounds a run, and it is reserved
+  // before a call starts, so widening this cannot overspend it.
+  async function drain(width) {
+    await Promise.all(Array.from({ length: width }, async () => {
+      while (queue.length && affordable() && !shouldStop()) {
+        const job = queue.shift()
+        if (!job) return
+        try { await withClaim(() => runJob(job)) } catch (err) {
+          if (err instanceof InsufficientBalance) return
+          throw err
+        }
+      }
+    }))
+  }
+
+  await drain(CONCURRENCY)
+
+  // The open web is the weakest pass and it runs alone at the end, so it gets
+  // the money the catalogues left rather than money they needed.
+  if (queue.length === 0 && affordable() && !shouldStop()) {
+    openWebRan = true
+    queue.push({ source: OPEN_WEB, url: '', page: 1, after: null, depth: 0 })
+    await drain(1)
   }
 
   if (shouldStop()) stoppedBecause = 'stopped by you'
   else if (!(balance > 0)) stoppedBecause = 'out of credit'
   else if (calls.length >= maxCalls) stoppedBecause = 'call limit reached'
-  else if (queue.length) stoppedBecause = 'budget spent'
+  else if (queue.length || !openWebRan) stoppedBecause = 'budget spent'
 
   accepted.sort((a, b) => a.start - b.start)
   progress({ phase: 'done', label: stoppedBecause })
@@ -351,6 +538,7 @@ export async function runScout(acc, {
     calls,
     sources: usedSources,
     discovered,
+    productive: [...productive.values()],
     stoppedBecause,
     tz: cityZone,
     startedAt,

@@ -94,18 +94,36 @@ per cent — and it is what the budget sheet quotes.
 ## 5. What one run does
 
 A run is not one search. One search returns the four events that happened to
-rank, which is how the first version behaved.
+rank, which is how the first version behaved — and asking a search-backed model
+to "walk the listing" does not fix it, because `:online` is a web search and the
+model never opens the page. It answers from snippets, so a portal with 44 events
+that day came back with one.
 
 1. **Catalogues.** From the registry (free), or one paid call that finds them.
-2. **Walk them.** One call per catalogue, asking for *every* event in the
-   window, up to 60 per answer. A catalogue that says `"more": true` and yielded
-   something new gets another pass, told where the last one stopped, up to three
-   passes.
-3. **One open-web pass** at the end, for what no catalogue lists.
-4. **Stop on the visitor's budget**, never on a fixed call count: before each
-   call the run checks whether the most expensive call so far would still fit
-   under the cap, and the cap is itself clamped to the balance. Cost is measured
-   from the PPQ balance around every single call.
+   Discovery asks for the page that shows the dated listing, not the section
+   front page, and asks for cinema by name — a city calendar carries concerts
+   and theatre and no films at all.
+2. **Fetch the page.** `src/reader.js` fetches each catalogue page directly
+   first and through `r.jina.ai` otherwise; the reader renders the page, returns
+   markdown and reflects the caller's origin, which is what makes this possible
+   from a static site. Fetching costs nothing, so the visitor's money goes into
+   extraction only.
+3. **Extract from that text.** The model is given the page and forbidden to
+   search or recall. A page that turns out to be a hub answers with the listing
+   URLs it points at (same host only) and those get walked instead; a paginated
+   listing answers with its own `next_url`. The page that actually held events is
+   what goes back into the registry.
+4. **Three at a time.** Catalogues do not depend on each other, so the visitor
+   waits for the slowest rather than the sum. A page that will not load falls
+   back to asking the model, which is all the run could ever do before.
+5. **One open-web pass** at the end, alone, for what no catalogue lists: it is
+   the weakest pass, so it gets the money the catalogues left.
+6. **Stop on the visitor's budget**, never on a fixed call count: the cost of a
+   job is reserved when it starts, not when its call goes out, so three workers
+   cannot each decide they fit while the other two are still fetching. Concurrent
+   calls cannot be priced individually from a balance delta, but the total can —
+   the balance is absolute, so `startBalance - balance` is what the account was
+   really charged — and per-call figures are that batch's share of it.
 
 Everything the city already has is fed into every prompt as "skip these", and
 everything that comes back is filtered again client-side with the same
@@ -151,15 +169,19 @@ network and it is not reachable without the query parameter.
 
 ## Known limits
 
-- Coverage is bound by the quality of PPQ's web search (Exa). Ticketed and
-  well-marked events come back well; the long tail of club flyers does not. The
-  cheap half of the problem — schema.org JSON-LD, ICS and RSS on venue pages —
-  needs a fetch the browser cannot do cross-origin, so it stays out of reach
-  until there is either a DVM (NIP-90) or an extension doing the fetching.
+- Coverage is bound by what a catalogue page shows to a fetcher. Server-rendered
+  listings extract well; pages that build their programme in the browser do not,
+  and cinema is the worst case — kino.de returns no showtimes even through a
+  JS-rendering reader, so a city's film programme depends on finding a
+  server-rendered source. schema.org JSON-LD, ICS and RSS on venue pages are now
+  within reach through the same reader and are not yet used.
+- The reader is a third party. It is a fallback with a direct fetch in front of
+  it, and a page that will not load degrades to a web search rather than
+  failing, but a run's completeness depends on a service nobody here operates.
 - Organiser claims and web-of-trust ranking are specified above but not built;
   the page counts raw endorsements and marks the ones from people you follow.
 - No recurrence support (NIP-52 has none yet).
-- A harvest is bound by what the model will read of a catalogue page. Deep
-  pagination is asked for and often delivered, but a thousand-entry week is not
-  going to arrive in one run; it arrives over several runs by several visitors,
-  which is why nothing is re-collected twice.
+- A harvest is bound by how much of a page fits in one call (60 000 characters,
+  cut at the end) and by how many pages a run follows: four of one listing, six
+  off one hub. A thousand-entry week still arrives over several runs by several
+  visitors, which is why nothing is re-collected twice.

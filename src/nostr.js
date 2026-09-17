@@ -3,7 +3,7 @@
 import { SimplePool, finalizeEvent, generateSecretKey, getPublicKey, nip19 } from 'nostr-tools'
 import {
   KIND_DATE_EVENT, KIND_TIME_EVENT, KIND_RSVP, KIND_REACTION, KIND_SCOUT_RUN, KIND_SOURCE,
-  parseEvent, eventAddress, buildSourceTags, parseSourceEvent,
+  parseEvent, eventAddress, buildSourceTags, parseSourceEvent, sourceDTag,
 } from './events.js'
 import { geohashPrefixes, encodeGeohash, slugify } from './geo.js'
 
@@ -166,8 +166,11 @@ export async function fetchScoutRuns(city) {
 
 // The catalogue registry for a city. Anyone who paid for the "which sites list
 // events here" question publishes the answer, so the next visitor's money goes
-// into events instead. Several scouts publish overlapping sets; one entry per
-// host wins, the most recently confirmed one.
+// into events instead. Several scouts publish overlapping sets, so entries are
+// deduplicated per page and the most recently confirmed one wins. Per page, not
+// per host: a portal's front page and the dated listing behind it are different
+// entries and only the second one is worth reading. A host is still capped, so
+// one site cannot fill the registry on its own.
 export async function fetchSources(city, { lat, lon } = {}) {
   const tags = [slugify(city), String(city || '').toLowerCase()].filter((v, i, a) => v && a.indexOf(v) === i)
   const filters = [{ kinds: [KIND_SOURCE], '#t': tags, limit: 200 }]
@@ -175,19 +178,31 @@ export async function fetchSources(city, { lat, lon } = {}) {
     filters.push({ kinds: [KIND_SOURCE], '#g': geohashPrefixes(encodeGeohash(lat, lon, 5), 4, 5), limit: 200 })
   }
   const batches = await Promise.all(filters.map(f => query(f)))
-  const byHost = new Map()
+  const byPage = new Map()
   for (const batch of batches) {
     for (const ev of batch) {
       const src = parseSourceEvent(ev)
       if (!src.url) continue
       let host
       try { host = new URL(src.url).hostname.replace(/^www\./, '') } catch { continue }
-      const prev = byHost.get(host)
-      if (!prev || prev.createdAt < src.createdAt) byHost.set(host, src)
+      src.host = host
+      const key = sourceDTag(src.url)
+      const prev = byPage.get(key)
+      if (!prev || prev.createdAt < src.createdAt) byPage.set(key, src)
     }
   }
-  return [...byHost.values()].sort((a, b) => b.createdAt - a.createdAt)
+  const perHost = new Map()
+  return [...byPage.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .filter(s => {
+      const n = perHost.get(s.host) || 0
+      if (n >= MAX_SOURCES_PER_HOST) return false
+      perHost.set(s.host, n + 1)
+      return true
+    })
 }
+
+export const MAX_SOURCES_PER_HOST = 4
 
 export async function publishSources(identity, sources, { city, lat, lon }) {
   let ok = 0

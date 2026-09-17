@@ -124,7 +124,7 @@ assert.ok(cands.length >= 30, 'a run walks catalogues instead of returning a han
 assert.match(candSummary, /calls over \d+ catalogues/)
 // The ticket shop in the mock re-lists an event the city already has, under its
 // own wording. It must be found and then dropped, not offered for publishing.
-const ticketRun = /muenchenticket\.de (\d+)\/(\d+)/.exec(candSummary)
+const ticketRun = /muenchenticket\.de\S* (\d+)\/(\d+)/.exec(candSummary)
 assert.ok(ticketRun && Number(ticketRun[1]) < Number(ticketRun[2]),
   'the re-listed event is found and then dropped: ' + (ticketRun ? ticketRun[0] : 'no ticket-shop line'))
 assert.equal((await m.$$('.cand.dup')).length, 0, 'nothing already published survives into the review list')

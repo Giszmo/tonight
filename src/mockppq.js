@@ -6,10 +6,14 @@
 import { InsufficientBalance, PPQ_BASE, DEFAULT_MODEL, sessionUrl, topUpUrl } from './ppq.js'
 
 const LS = { account: 'tonight.mockppq' }
-const COST = { catalogues: 0.0125, harvest: 0.0205 }
+// Extraction from a page we supply carries no search fee, which is why it is
+// the cheaper of the two as well as the complete one.
+const COST = { catalogues: 0.0125, harvest: 0.0205, extract: 0.0043 }
 
 const CATALOGUES = [
   { name: 'in München — das Stadtmagazin', url: 'https://www.in-muenchen.de/veranstaltungen', kind: 'magazine', covers: 'concerts, theatre, clubs, cinema, day by day' },
+  // deliberately the section front page, like the real registry entry that
+  // returned one event: it lists no dates, only links to the listings
   { name: 'muenchen.de Veranstaltungskalender', url: 'https://www.muenchen.de/veranstaltungen', kind: 'city', covers: 'the municipality’s own calendar' },
   { name: 'München Ticket', url: 'https://www.muenchenticket.de/events', kind: 'tickets', covers: 'ticketed events across the city' },
   { name: 'Gasteig HP8 Programm', url: 'https://www.gasteig.de/programm', kind: 'venue', covers: 'classical, talks, workshops' },
@@ -29,6 +33,68 @@ const SHOWS = [
   ['Lesung: Neue Münchner Prosa', 'Literaturhaus', 'talk'],
   ['Improtheater Nachtschicht', 'Volkstheater', 'theatre'],
 ]
+
+// The pages the fake catalogues serve. muenchen.de/veranstaltungen is a hub
+// with no dates on it, exactly like the real one, so the run has to notice that
+// and follow the listing it points at; the others are listings, one of them
+// paginated.
+const HUBS = { 'https://www.muenchen.de/veranstaltungen': ['https://www.muenchen.de/veranstaltungen/event/heute'] }
+
+function mockPage(url) {
+  if (HUBS[url]) {
+    return `Veranstaltungen in München\n\nHighlights und Tipps\n` +
+      HUBS[url].map(u => `* [Das Programm für heute](${u})`).join('\n') +
+      '\n* [Museen](https://www.muenchen.de/veranstaltungen/museen)\n'
+  }
+  const src = CATALOGUES.find(c => url.startsWith(c.url)) || CATALOGUES[1]
+  const idx = CATALOGUES.indexOf(src)
+  const page = /[?&]seite=(\d+)/.exec(url) ? parseInt(/[?&]seite=(\d+)/.exec(url)[1], 10) : 1
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0)
+  const lines = []
+  for (let day = (page - 1) * 3; day < page * 3 + 1; day++) {
+    for (let k = 0; k < 4; k++) {
+      const show = SHOWS[(idx * 5 + day * 4 + k) % SHOWS.length]
+      const at = new Date(midnight.getTime() + day * 86400000)
+      at.setHours(18 + ((k * 2) % 6), k === 1 ? 30 : 0, 0, 0)
+      lines.push(`* [${show[0]}](${src.url}/${slug(show[0])}-${day}) — ${local(at).replace('T', ' ')} — ${show[1]} — ${show[2]}`)
+    }
+  }
+  const next = page < 2 ? `\n[Weiter](${src.url}?seite=${page + 1})\n` : '\n'
+  return `${src.name}\n\nTermine im Kalender\n\n${lines.join('\n')}\n${next}`
+}
+
+// The fake model does what a real one does with a page we hand it: it reads the
+// page and nothing else.
+function extractFrom(prompt) {
+  const body = prompt.split('--- page text of ')[1] || ''
+  const url = body.slice(0, body.indexOf('\n')).replace(/ ---$/, '').trim()
+  const events = [...body.matchAll(/^\* \[([^\]]+)\]\(([^)]+)\) — ([\d-]{10} [\d:]{5}) — ([^—]+) — (\w+)$/gm)]
+    .map(m => ({
+      title: m[1], url: m[2], start: m[3].replace(' ', 'T'), end: null,
+      venue: m[4].trim(), address: m[4].trim() + ', München', category: m[5],
+      summary: `${m[1]} im ${m[4].trim()}.`,
+    }))
+  // The ticket shop re-lists an event the city already has, under its own
+  // wording, because real ones ignore a skip list too - that is what the
+  // client-side dedup is there to catch.
+  if (/muenchenticket/.test(url)) {
+    const k = /^- ([\d-]+ [\d:]+) UTC (.+)$/m.exec(prompt)
+    if (k) {
+      const at = new Date(Date.parse(k[1].replace(' ', 'T') + 'Z') + 300000)
+      const [title, venue = ''] = k[2].split(' @ ')
+      events.unshift({
+        title: title + ' (Tickets)', url: url + '/' + slug(title), start: local(at), end: null,
+        venue, address: venue + ', München', category: 'other', summary: 'Tickets ab sofort.',
+      })
+    }
+  }
+  const listing = events.length ? [] : [...body.matchAll(/\((https?:\/\/[^)]+)\)/g)].map(m => m[1])
+  const nextUrl = /\[Weiter\]\((https?:\/\/[^)]+)\)/.exec(body)?.[1] || ''
+  return {
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    events, listing_urls: listing, next_url: nextUrl, more: !!nextUrl, covered_until: null, url,
+  }
+}
 
 export function mockPpq() {
   let invoices = new Map()
@@ -83,7 +149,14 @@ export function mockPpq() {
       return { status: 'paid', amount_paid: inv.usd }
     },
 
-    async chat(acc, { messages, model = DEFAULT_MODEL }) {
+    // Fetching a page is free in the real run too, so the mock charges nothing
+    // for it - and it never touches the network.
+    async fetchPage(url) {
+      await new Promise(r => setTimeout(r, 120))
+      return mockPage(url)
+    },
+
+    async chat(acc, { messages, model = DEFAULT_MODEL, search = true }) {
       if (!(await getBalance() > 0)) throw new InsufficientBalance()
       const prompt = messages.map(m => m.content).join('\n')
       await new Promise(r => setTimeout(r, 400))
@@ -91,8 +164,12 @@ export function mockPpq() {
         charge(COST.catalogues)
         return { text: JSON.stringify({ sources: CATALOGUES }), model: model + ':online', usage: null }
       }
+      if (/--- page text of /.test(prompt)) {
+        charge(COST.extract)
+        return { text: JSON.stringify(extractFrom(prompt)), model, usage: null }
+      }
       charge(COST.harvest)
-      return { text: JSON.stringify(harvestFor(prompt)), model: model + ':online', usage: null }
+      return { text: JSON.stringify(harvestFor(prompt)), model: model + (search ? ':online' : ''), usage: null }
     },
   }
 }

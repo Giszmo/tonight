@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import {
   parseCandidates, parseHarvest, parseSources, buildHarvestMessages, buildSourceMessages,
-  findDuplicate, runScout, makeGeocoder, zonedToSeconds, validZone,
+  findDuplicate, runScout, makeGeocoder, zonedToSeconds, validZone, shortUrl,
 } from '../src/scout.js'
+import { htmlToText, readPage, PageUnavailable } from '../src/reader.js'
 import { InsufficientBalance } from '../src/ppq.js'
 
 // ---------- parsing ----------
@@ -97,21 +98,29 @@ const ev = (title, dayOffset = 0, venue = 'Hall') =>
 // the fake catalogues quote UTC and say so, the way a real answer carries its zone
 const harvest = (events, more = false) => JSON.stringify({ tz: 'UTC', events, more })
 
+// No test reaches the network: a run that cannot fetch a catalogue falls back
+// to asking the model, which is exactly the pre-existing behaviour these cases
+// were written against.
+const offline = async () => { throw new PageUnavailable('x', 'offline') }
+
 function fakeApi({ balance = 1, perCall = 0.02, answer }) {
   let b = balance
   const seen = []
-  return {
+  const api = {
     InsufficientBalance,
     seen,
     getBalance: async () => b,
-    chat: async (_acc, { messages }) => {
+    opts: [],
+    chat: async (_acc, { messages, search = true }) => {
       const prompt = messages.map(m => m.content).join('\n')
       seen.push(prompt)
+      api.opts.push({ search })
       if (b <= 0) throw new InsufficientBalance()
       b = +(b - perCall).toFixed(5)
       return { text: answer(prompt, seen.length), model: 'fake-model:online' }
     },
   }
+  return api
 }
 
 const CATALOGUES = JSON.stringify({ sources: [
@@ -120,7 +129,7 @@ const CATALOGUES = JSON.stringify({ sources: [
 ] })
 
 // a full run: catalogues, both of them walked, one paginated, duplicates dropped
-let run = await runScout({}, {
+let run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1, api: fakeApi({
     answer: (prompt) => {
       if (/List the web pages that catalogue/.test(prompt)) return CATALOGUES
@@ -145,7 +154,7 @@ assert.equal(run.stoppedBecause, 'window covered')
 assert.equal(run.sources.length, 2)
 
 // events the city already has are not re-collected even if a catalogue lists them
-run = await runScout({}, {
+run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
   known: [{ title: 'Opening Night', venue: 'Hall', start: FROM, coords: null, refs: [], address: '', d: '' }],
   sources: [{ url: 'https://one.test/events', name: 'One' }],
@@ -156,7 +165,7 @@ assert.deepEqual(run.candidates.map(c => c.title), ['Something Else'],
 assert.ok(run.calls.every(c => c.label !== 'catalogues'), 'a known source list skips the discovery call')
 
 // the budget is a hard stop: no call is made that could cross it
-run = await runScout({}, {
+run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 0.05,
   api: fakeApi({ answer: (p) => /catalogue in/.test(p) ? CATALOGUES : CATALOGUES }),
 })
@@ -165,7 +174,7 @@ assert.ok(run.costUsd <= 0.05, 'a run never spends more than the budget: ' + run
 assert.equal(run.stoppedBecause, 'budget spent')
 
 // the budget can never exceed the balance
-run = await runScout({}, {
+run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 10,
   api: fakeApi({ balance: 0.05, answer: () => harvest([]) }),
 })
@@ -173,7 +182,7 @@ assert.equal(run.budgetUsd, 0.05)
 
 // stopping mid-run is honoured
 let n = 0
-run = await runScout({}, {
+run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
   api: fakeApi({ answer: () => { n++; return CATALOGUES } }),
   shouldStop: () => n >= 2,
@@ -182,11 +191,11 @@ assert.equal(run.stoppedBecause, 'stopped by you')
 
 // no money, no call
 await assert.rejects(
-  runScout({}, { city: 'Testheim', from: FROM, to: TO, api: fakeApi({ balance: 0, answer: () => '' }) }),
+  runScout({}, { fetchPage: offline, city: 'Testheim', from: FROM, to: TO, api: fakeApi({ balance: 0, answer: () => '' }) }),
   (err) => err instanceof InsufficientBalance)
 
 // a catalogue that answers with junk does not kill the run
-run = await runScout({}, {
+run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
   sources: [{ url: 'https://one.test/events' }, { url: 'https://two.test/events' }],
   api: fakeApi({ answer: (p) => p.includes('one.test') ? 'sorry, nothing found' : harvest([ev('Survivor')]) }),
@@ -194,7 +203,7 @@ run = await runScout({}, {
 assert.deepEqual(run.candidates.map(c => c.title), ['Survivor'], 'one bad answer does not end the run')
 
 // events outside the asked window are dropped even if the model returns them
-run = await runScout({}, {
+run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: FROM + 86400, budgetUsd: 1,
   sources: [{ url: 'https://one.test/events' }],
   api: fakeApi({ answer: () => harvest([ev('In Window'), ev('Next Week', 7)]) }),
@@ -205,7 +214,7 @@ assert.deepEqual(run.candidates.map(c => c.title), ['In Window'])
 
 // Known sources come from nostr, so a normal run pays for events only...
 const registry = [{ url: 'https://one.test/events', name: 'One' }]
-run = await runScout({}, {
+run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1, sources: registry,
   api: fakeApi({ answer: () => harvest([ev('From The Registry')]) }),
 })
@@ -213,7 +222,7 @@ assert.ok(!run.calls.some(c => c.label === 'catalogues'), 'a populated registry 
 assert.equal(run.discovered.length, 0, 'nothing new to publish')
 
 // ...and an occasional run asks for catalogues beyond the ones nostr has.
-run = await runScout({}, {
+run = await runScout({}, { fetchPage: offline,
   city: 'Testheim', from: FROM, to: TO, budgetUsd: 1, sources: registry, discover: 'always',
   api: fakeApi({
     answer: (p) => /List the web pages that catalogue/.test(p)
@@ -223,7 +232,145 @@ run = await runScout({}, {
 })
 assert.deepEqual(run.discovered.map(s => s.name), ['Three'], 'only genuinely new catalogues are published back')
 assert.deepEqual(run.sources.map(s => s.name), ['Three', 'One'], 'the unexplored one is walked first')
-assert.ok(run.calls.some(c => c.label === 'three.test'), 'the new catalogue is actually read in the same run')
+assert.ok(run.calls.some(c => c.label === 'three.test/events'), 'the new catalogue is actually read in the same run')
+
+
+// ---------- reading the page instead of searching for it ----------
+
+// The bug this whole path exists for: a search-backed model never opens the
+// listing. It answers from snippets, so a portal with forty-four events that
+// day came back with one. When we hand it the page, the prompt must forbid
+// everything except that page.
+const page = buildHarvestMessages({
+  city: 'München', from: FROM, to: TO,
+  url: 'https://muenchen.test/veranstaltungen/heute',
+  pageText: '* [Konzert](https://muenchen.test/k) — 2026-09-20 20:00 — Gasteig — concert',
+})
+assert.match(page[0].content, /extract public events from the page text/i)
+assert.doesNotMatch(page[0].content, /search the web/i, 'extraction must not invite a web search')
+assert.match(page[1].content, /Do not search, do not recall/)
+assert.match(page[1].content, /--- page text of https:\/\/muenchen\.test\/veranstaltungen\/heute ---/)
+assert.match(page[1].content, /listing_urls/, 'a hub can answer with the listings it points at')
+
+// Links the model reports are resolved against the page and kept only if they
+// stay on it: a hub's "listings" routinely include a ticket shop's banner.
+const links = parseHarvest(
+  '{"events":[],"listing_urls":["/veranstaltungen/heute","https://ads.test/x"],"next_url":"?seite=2"}',
+  { base: 'https://muenchen.test/veranstaltungen' })
+assert.deepEqual(links.listingUrls, ['https://muenchen.test/veranstaltungen/heute'])
+assert.equal(links.nextUrl, 'https://muenchen.test/veranstaltungen?seite=2')
+assert.equal(parseHarvest('{"events":[],"next_url":"https://ads.test/x"}', { base: 'https://muenchen.test/a' }).nextUrl, '')
+
+// A registry entry pointing at a section front page - which is what a search
+// engine offers, and what the first Munich run got - has to be followed to the
+// dated listing behind it, in the same run and without a second search.
+const HUB = 'https://muenchen.test/veranstaltungen'
+const LIST = 'https://muenchen.test/veranstaltungen/heute'
+const pages = {
+  [HUB]: `Veranstaltungen\n* [Programm für heute](${LIST})`,
+  [LIST]: `Termine\n* [Konzert](${LIST}/k) — heute 20:00 — Gasteig`,
+  [LIST + '?seite=2']: `Termine\n* [Lesung](${LIST}/l) — heute 21:00 — Literaturhaus`,
+}
+let fetched = []
+const pageApi = fakeApi({
+  answer: (p) => {
+    const url = (p.match(/--- page text of (\S+) ---/) || [])[1]
+    if (url === HUB) return JSON.stringify({ tz: 'UTC', events: [], listing_urls: [LIST] })
+    if (url === LIST) return JSON.stringify({ tz: 'UTC', events: [ev('Konzert')], next_url: LIST + '?seite=2' })
+    if (url) return JSON.stringify({ tz: 'UTC', events: [ev('Lesung', 1)] })
+    return harvest([])   // the open-web pass
+  },
+})
+run = await runScout({}, {
+  city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+  sources: [{ url: HUB, name: 'Stadtportal', kind: 'city' }],
+  api: pageApi,
+  fetchPage: async (u) => { fetched.push(u); if (!pages[u]) throw new PageUnavailable(u, '404'); return pages[u] },
+})
+assert.deepEqual(fetched, [HUB, LIST, LIST + '?seite=2'], 'the hub is followed to the listing and then paginated')
+assert.deepEqual(run.candidates.map(c => c.title), ['Konzert', 'Lesung'])
+assert.ok(pageApi.opts.slice(0, 3).every(o => o.search === false),
+  'extraction from a page we fetched costs no search fee')
+assert.equal(pageApi.opts[3].search, true, 'the open-web pass is still a search')
+assert.deepEqual(run.productive.map(s => s.url), [LIST, LIST + '?seite=2'],
+  'the pages that held events go to the registry - the hub that held none does not')
+
+// A page that will not load is not a dead end: the run asks the model instead,
+// which is all it could ever do before.
+run = await runScout({}, {
+  city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+  sources: [{ url: 'https://blocked.test/events', name: 'Blocked' }],
+  api: fakeApi({ answer: () => harvest([ev('Found Anyway')]) }),
+  fetchPage: async (u) => { throw new PageUnavailable(u, 'cors') },
+})
+assert.deepEqual(run.candidates.map(c => c.title), ['Found Anyway'])
+
+assert.equal(shortUrl('https://www.muenchen.de/veranstaltungen/event/heute'), 'muenchen.de/veranstaltungen/event/heu…')
+assert.equal(shortUrl('https://one.test/events'), 'one.test/events')
+
+// ---------- the reader ----------
+
+assert.equal(htmlToText('<div>Konzert<script>junk()</script><br>20:00 &amp; sold out</div>'), 'Konzert \n20:00 & sold out')
+
+// Direct first, because a catalogue that allows it costs nothing extra; the
+// reader second, because almost none of them do.
+let calls = []
+const fakeFetch = (behaviour) => async (url) => {
+  calls.push(url)
+  const r = behaviour(url)
+  if (r instanceof Error) throw r
+  return { ok: r !== null, status: r === null ? 451 : 200, text: async () => r }
+}
+const long = 'Termine 20:00\n'.repeat(200).trim()
+assert.equal(await readPage('https://ok.test/x', { fetchImpl: fakeFetch(() => long) }), long)
+assert.deepEqual(calls, ['https://ok.test/x'], 'a CORS-friendly catalogue is never sent through the reader')
+
+calls = []
+const viaReader = await readPage('https://cors.test/x', {
+  fetchImpl: fakeFetch((u) => u.startsWith('https://r.jina.ai/') ? long : new TypeError('CORS')),
+})
+assert.equal(viaReader, long)
+assert.deepEqual(calls, ['https://cors.test/x', 'https://r.jina.ai/https://cors.test/x'])
+
+await assert.rejects(
+  readPage('https://dead.test/x', { fetchImpl: fakeFetch(() => new TypeError('nope')) }),
+  (err) => err instanceof PageUnavailable && /could not read https:\/\/dead\.test\/x/.test(err.message))
+
+// A listing is cut at the end, never in the middle: the tail is pagination
+// furniture, the head is the events.
+const clipped = await readPage('https://ok.test/x', { fetchImpl: fakeFetch(() => long), maxChars: 100 })
+assert.ok(clipped.startsWith(long.slice(0, 100)) && clipped.endsWith('[page truncated]'))
+
+
+// Catalogues do not depend on each other, so they are read at the same time -
+// the visitor waits for the slowest, not for the sum. The budget is reserved
+// when a job starts, not when its call goes out, or three workers would each
+// decide they fit while the other two were still fetching.
+let live = 0, peak = 0
+const slow = async (fn) => { live++; peak = Math.max(peak, live); await new Promise(r => setTimeout(r, 30)); live--; return fn() }
+run = await runScout({}, {
+  city: 'Testheim', from: FROM, to: TO, budgetUsd: 1,
+  sources: [1, 2, 3, 4, 5].map(n => ({ url: `https://cat${n}.test/events` })),
+  fetchPage: (u) => slow(() => `Termine\n* ${u}`),
+  api: fakeApi({ answer: (p) => {
+    const n = (p.match(/cat(\d)/) || [])[1]
+    return JSON.stringify({ tz: 'UTC', events: n ? [ev('Show ' + n)] : [] })
+  } }),
+})
+assert.equal(run.candidates.length, 5, 'all five catalogues were read')
+assert.ok(peak > 1, 'catalogues are fetched concurrently, peak was ' + peak)
+assert.ok(peak <= 3, 'and no wider than the pool, peak was ' + peak)
+
+// A budget that only fits two calls still only buys two, however many workers
+// are racing for it.
+run = await runScout({}, {
+  city: 'Testheim', from: FROM, to: TO, budgetUsd: 0.05,
+  sources: [1, 2, 3, 4, 5].map(n => ({ url: `https://cat${n}.test/events` })),
+  fetchPage: (u) => slow(() => `Termine\n* ${u}`),
+  api: fakeApi({ answer: () => JSON.stringify({ tz: 'UTC', events: [] }) }),
+})
+assert.equal(run.calls.length, 2, 'concurrency does not loosen the budget: ' + run.calls.length + ' calls')
+assert.ok(run.costUsd <= 0.05)
 
 // ---------- geocoding budget ----------
 
