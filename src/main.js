@@ -301,7 +301,7 @@ function renderCard(group) {
   const e = group.canonical
   const place = currentPlace()
   const km = e.coords ? haversineKm({ lat: place.lat, lon: place.lon }, e.coords) : null
-  const end = e.endorsements = endorsementsFor(group)
+  const end = endorsementsFor(group)
   const meta = [e.venue || 'venue unknown']
   if (km !== null) meta.push(km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`)
   if (group.copies.length > 1) meta.push(`${group.copies.length} sources`)
@@ -355,7 +355,7 @@ function sourceLabel(url) {
 async function onGoing(group, button) {
   button.disabled = true
   try {
-    await publishRsvp(state.identity, group.canonical.raw ? group.canonical : group.canonical)
+    await publishRsvp(state.identity, group.canonical)
     button.classList.add('on')
     button.textContent = 'going ✓'
   } catch (err) {
