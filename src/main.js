@@ -318,7 +318,14 @@ function renderRunInfo() {
     : 'A run costs what you let it: it walks the city catalogues until your budget is gone.')
   if (state.sources.length) bits.push(`${state.sources.length} catalogues known.`)
   if (state.balance !== null) bits.push(`Balance ${usd(state.balance)}.`)
-  box.textContent = bits.join(' ')
+  // Adding a catalogue is free and it is the one contribution somebody who
+  // knows the city can make without any credit at all, so it does not live
+  // behind the spending sheet.
+  box.replaceChildren(bits.join(' ') + ' ', el('button', {
+    class: 'linky',
+    text: 'Add a catalogue',
+    onclick: () => openAddSourceSheet(),
+  }))
 }
 
 // PPQ quotes the amount due in BTC; wallets and humans think in sats.
@@ -660,6 +667,79 @@ function openScoutSheet(acc) {
       el('button', { class: 'ghost', text: 'top up first', onclick: () => openTopupSheet(acc) }),
     ),
     el('p', { class: 'dim', text: `Balance ${usd(state.balance)}. You see every candidate before anything is published, and you sign what you publish.` }),
+    el('p', {}, el('button', {
+      class: 'ghost',
+      text: 'know a page we should be reading? add it',
+      onclick: () => openAddSourceSheet(),
+    })),
+  )
+}
+
+// Anyone can add a catalogue, and that is the point.
+//
+// Scouting finds what a search engine ranks. It missed ma.to for Lisbon, which
+// had twelve films on that evening in a city where the run published two, and
+// it will keep missing whatever is not SEO-shaped: a venue's own calendar, a
+// mailing list's web archive, the page a local nerd already reads every
+// Thursday. Somebody who knows the city knows that page. The registry is a
+// nostr event, so adding it once helps every future visitor's run here, and it
+// costs nothing to write and nothing to read.
+async function openAddSourceSheet() {
+  const place = currentPlace()
+  const url = el('input', { type: 'url', placeholder: 'https://…', autocomplete: 'off', spellcheck: 'false' })
+  const name = el('input', { type: 'text', placeholder: `optional, e.g. "${place.name} city magazine"` })
+  const kind = el('select', {}, ...[
+    ['magazine', 'what-is-on magazine or city guide'],
+    ['city', 'the municipality\'s own calendar'],
+    ['cinema', 'film programme'],
+    ['tickets', 'ticket platform'],
+    ['venue', 'a venue\'s own programme'],
+    ['university', 'university or church calendar'],
+    ['other', 'something else'],
+  ].map(([v, label]) => el('option', { value: v, text: label })))
+  const covers = el('input', { type: 'text', placeholder: 'what it lists, one line' })
+  const msg = el('p', { class: 'dim' })
+  const save = el('button', { class: 'primary', text: `Add it for ${place.name}` })
+
+  save.addEventListener('click', async () => {
+    const href = url.value.trim()
+    if (!/^https?:\/\/\S+\.\S+/.test(href)) { msg.textContent = 'That does not look like a web address.'; return }
+    // The same rule the run's own registry obeys: a URL with one calendar day
+    // in it is a catalogue for one evening and a dead link after it.
+    if (isDatedUrl(href)) {
+      msg.textContent = 'That address has one particular day in it, so it would be dead tomorrow. ' +
+        'Use the listing that stays at the same address.'
+      return
+    }
+    save.disabled = true
+    msg.textContent = 'publishing…'
+    try {
+      await publishSources(state.identity, [{
+        url: href, name: name.value.trim() || hostLabel(href), kind: kind.value, covers: covers.value.trim(),
+      }], { city: place.name, aliases: cityAliases(), lat: place.lat, lon: place.lon })
+      $('sheet').close()
+      await load()
+    } catch (err) {
+      console.warn('adding a catalogue failed', err)
+      msg.textContent = 'The relays would not take it. Try again?'
+      save.disabled = false
+    }
+  })
+
+  openSheet(
+    el('h2', { text: `Add a catalogue for ${place.name}` }),
+    el('p', { class: 'dim', text: 'A page that lists dated events here. Every run in this city will read it from now ' +
+      'on, and so will everyone else\'s - the list lives on the relays, not in this browser.' }),
+    el('p', { class: 'dim', text: 'The listing itself, not the front page: a "today", "this week" or calendar view.' }),
+    el('p', {}, url),
+    el('p', {}, name),
+    el('p', {}, kind),
+    el('p', {}, covers),
+    msg,
+    el('p', {},
+      save,
+      el('button', { class: 'ghost', text: 'cancel', onclick: () => $('sheet').close() }),
+    ),
   )
 }
 

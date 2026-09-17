@@ -110,6 +110,11 @@ main { max-width: var(--max); margin: 0 auto; padding: 0 1rem }
   padding: .7rem 1rem calc(.7rem + env(safe-area-inset-bottom));
 }
 .runinfo { font-size: .84rem; color: var(--dim); max-width: 28rem }
+/* A link that happens to be a button: it belongs in the sentence it sits in. */
+.linky {
+  font: inherit; cursor: pointer; background: none; border: 0; padding: 0;
+  color: var(--accent); text-decoration: underline; text-underline-offset: .15em;
+}
 .primary {
   font: inherit; font-weight: 620; cursor: pointer; white-space: nowrap;
   background: var(--accent); color: var(--accent-ink); border: 0; border-radius: var(--radius);
